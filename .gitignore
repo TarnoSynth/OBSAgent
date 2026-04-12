@@ -1,0 +1,20 @@
+# Sekrety i lokalna konfiguracja
+.env
+config.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logi
+logs/
+
+# IDE
+.idea/
+*.swp
+
+.cursorrules/
+.cursor/

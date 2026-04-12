@@ -1,0 +1,72 @@
+# ============================================================
+# Obsidian Git Documentation Agent — konfiguracja
+# Skopiuj jako config.yaml i uzupełnij swoje ścieżki.
+# Klucze API trzymaj w .env, nie tutaj.
+# ============================================================
+
+paths:
+  # Ścieżka absolutna do repozytorium z kodem projektu.
+  # Agent czyta stąd commity i diffy — nigdy nie modyfikuje tego repo.
+  project_repo: /home/user/projects/AthleteStack
+
+  # Ścieżka absolutna do Obsidian vault.
+  # Agent tworzy i aktualizuje tutaj notatki .md.
+  # Vault musi być zainicjalizowany jako repo git (plugin Obsidian Git).
+  vault: /home/user/vaults/AthleteStack-docs
+
+# Który provider AI ma być używany.
+# Dopuszczalne wartości: anthropic | openai | openrouter
+# Klucz API odpowiedniego providera musi być ustawiony w .env
+provider: anthropic
+
+providers:
+  anthropic:
+    # Lista modeli: https://docs.anthropic.com/en/docs/about-claude/models
+    model: claude-sonnet-4-20250514
+
+  openai:
+    # Lista modeli: https://platform.openai.com/docs/models
+    model: gpt-4o
+
+  openrouter:
+    # OpenRouter udostępnia modele różnych providerów pod jednym API.
+    # Format nazwy modelu: provider/nazwa, np. anthropic/claude-sonnet-4-20250514
+    # Lista modeli: https://openrouter.ai/models
+    model: anthropic/claude-sonnet-4-20250514
+    base_url: https://openrouter.ai/api/v1
+
+agent:
+  # Maksymalna liczba linii diffa per plik wysyłana do AI.
+  # Diffy powyżej tego limitu zostaną obcięte — AI dostanie
+  # podsumowanie zamiast surowego diffa.
+  # Niższa wartość = mniejszy koszt API, ale mniej szczegółowa analiza.
+  # Zakres: 100–1000. Domyślnie 300.
+  max_diff_lines: 300
+
+  # Ile ostatnich commitów analizować przy pierwszym uruchomieniu,
+  # gdy nie istnieje jeszcze plik .agent-state.json.
+  # Przy kolejnych uruchomieniach agent analizuje tylko nowe commity
+  # (od ostatniego zapisanego w stanie).
+  # Zakres: 1–50. Domyślnie 10.
+  default_commits: 10
+
+  # Język generowanej dokumentacji w vault.
+  # Wpływa na system prompt wysyłany do AI.
+  # Dopuszczalne wartości: pl | en
+  language: pl
+
+  # Co ile sekund watcher sprawdza czy pojawiły się nowe commity.
+  # Dotyczy tylko trybu: python main.py watch
+  # Zakres: 10–300. Domyślnie 30.
+  watch_interval: 30
+
+# Wzorce plików ignorowanych przy analizie diffów.
+# Pliki pasujące do tych wzorców nie będą wysyłane do AI.
+# Format: glob patterns.
+ignore_patterns:
+  - "*.lock"
+  - "*.pyc"
+  - "__pycache__/"
+  - "node_modules/"
+  - ".obsidian/"
+  - ".env"
