@@ -10,7 +10,9 @@ import yaml
 from dotenv import load_dotenv
 
 from .base import BaseProvider
+from .anthropic import AnthropicProvider
 from .openai import OpenAIProvider
+from .openrouter import OpenRouterProvider
 
 
 def _project_root() -> Path:
@@ -55,5 +57,48 @@ def build_provider(config_path: Path | str | None = None) -> BaseProvider:
         if not api_key:
             raise RuntimeError("Brak OPENAI_API_KEY — ustaw w .env lub środowisku")
         return OpenAIProvider(api_key=api_key, default_model=str(model))
+
+    if name == "anthropic":
+        section = providers.get("anthropic")
+        if not isinstance(section, dict):
+            raise ValueError("config: brak providers.anthropic")
+        model = section.get("model")
+        if not model:
+            raise ValueError("config: providers.anthropic.model jest wymagane")
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("Brak ANTHROPIC_API_KEY — ustaw w .env lub środowisku")
+        return AnthropicProvider(api_key=api_key, default_model=str(model))
+
+    if name == "openrouter":
+        section = providers.get("openrouter")
+        if not isinstance(section, dict):
+            raise ValueError("config: brak providers.openrouter")
+        model = section.get("model")
+        if not model:
+            raise ValueError("config: providers.openrouter.model jest wymagane")
+
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("Brak OPENROUTER_API_KEY — ustaw w .env lub środowisku")
+
+        base_url = section.get("base_url")
+        http_referer = section.get("http_referer") or os.environ.get("OPENROUTER_HTTP_REFERER")
+        app_title = section.get("title") or os.environ.get("OPENROUTER_TITLE")
+        timeout_raw = section.get("timeout", 60.0)
+
+        try:
+            timeout = float(timeout_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("config: providers.openrouter.timeout musi byc liczba") from exc
+
+        return OpenRouterProvider(
+            api_key=api_key,
+            default_model=str(model),
+            base_url=str(base_url) if base_url else "https://openrouter.ai/api/v1",
+            http_referer=str(http_referer) if http_referer else None,
+            app_title=str(app_title) if app_title else None,
+            timeout=timeout,
+        )
 
     raise NotImplementedError(f"Provider '{name}' nie jest jeszcze zaimplementowany w fabryce")

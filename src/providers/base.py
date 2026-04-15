@@ -29,11 +29,45 @@ class ChatMessage(BaseModel):
     """Pojedyncza wiadomość w formacie niezależnym od dostawcy.
 
     name: opcjonalnie przy USER (np. rozróżnienie użytkowników w jednym wątku).
+    tool_call_id: powiązanie odpowiedzi narzędzia z wcześniejszym wywołaniem assistant.tool_calls.
+    tool_calls: lista wywołań narzędzi zwrócona przez model w wiadomości assistant.
     """
 
     role: MessageRole
-    content: str
+    content: str | None = None
     name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list["ToolCall"] = Field(default_factory=list)
+
+
+class ToolFunctionDefinition(BaseModel):
+    """Definicja funkcji udostępnianej modelowi przez tool calling."""
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolDefinition(BaseModel):
+    """Jedno narzędzie w formacie zbliżonym do OpenAI/OpenRouter Chat API."""
+
+    type: str = "function"
+    function: ToolFunctionDefinition
+
+
+class ToolFunctionCall(BaseModel):
+    """Wywołanie konkretnej funkcji przez model."""
+
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    """Jedno wywołanie narzędzia zwrócone przez model lub odsyłane z powrotem do API."""
+
+    id: str | None = None
+    type: str = "function"
+    function: ToolFunctionCall
 
 
 class UsageStats(BaseModel):
@@ -60,6 +94,9 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = None
     stop: str | Sequence[str] | None = None
     top_p: float | None = None
+    tools: list[ToolDefinition] = Field(default_factory=list)
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -77,6 +114,7 @@ class ProviderResult(BaseModel):
     model: str
     finish_reason: str | None = None
     usage: UsageStats | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
     raw: Any = None
 
 
