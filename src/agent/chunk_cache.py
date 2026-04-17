@@ -70,15 +70,32 @@ class ChunkCache:
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> "ChunkCache":
-        """Buduje cache dir \u2014 domyslnie ``<obok config.yaml>/.agent-cache/``.
+        """Buduje cache dir z ``agent.cache_dir`` albo defaultu ``.agent-cache``.
 
-        Nie czyta nic z samego configu (jeszcze) \u2014 sciezka jest
-        pochodna config_path. Gdy kiedys dodamy ``agent.cache_dir``,
-        wystarczy zmienic tutaj jednen if.
+        Sciezka z configu moze byc relatywna (liczona wzgledem katalogu
+        ``config.yaml``) albo absolutna. Brak wpisu = default ``.agent-cache``
+        obok configa.
         """
 
+        import yaml
+
         cfg_path = Path(config_path).expanduser().resolve()
-        cache_dir = cfg_path.parent / DEFAULT_CACHE_DIRNAME
+        try:
+            raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except OSError:
+            raw = {}
+
+        agent_cfg = raw.get("agent") if isinstance(raw, dict) else None
+        cache_dir_raw = (
+            agent_cfg.get("cache_dir") if isinstance(agent_cfg, dict) else None
+        )
+        if isinstance(cache_dir_raw, str) and cache_dir_raw.strip():
+            candidate = Path(cache_dir_raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = cfg_path.parent / candidate
+            cache_dir = candidate
+        else:
+            cache_dir = cfg_path.parent / DEFAULT_CACHE_DIRNAME
         return cls(cache_dir=cache_dir)
 
     def get_chunk(self, commit_sha: str, chunk: DiffChunk) -> DiffChunk | None:

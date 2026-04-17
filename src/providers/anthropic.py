@@ -26,6 +26,20 @@ from .base import (
 )
 
 
+def _describe_httpx_error(exc: Exception) -> str:
+    """Zwraca niepusty opis bledu httpx — wiele typow ma pusty ``str()``.
+
+    Przyklad: ``httpx.ReadTimeout`` nie niesie ``args``, wiec ``str(exc)`` jest
+    pustym stringiem, co daje log ``"Blad komunikacji z Anthropic API: "``
+    bez zadnej informacji. ``repr`` + nazwa typu daje minimum kontekstu.
+    """
+    msg = str(exc).strip()
+    type_name = type(exc).__name__
+    if msg:
+        return f"{type_name}: {msg}"
+    return f"{type_name} (bez komunikatu, repr={exc!r})"
+
+
 class AnthropicProvider(BaseProvider):
     """Provider LLM dla Anthropic Messages API.
 
@@ -41,23 +55,34 @@ class AnthropicProvider(BaseProvider):
         base_url: str = "https://api.anthropic.com",
         anthropic_version: str = "2023-06-01",
         default_max_tokens: int = 4096,
-        timeout: float = 60.0,
         max_retries: int = 3,
+        timeout: float | None = None,
+        connect_timeout: float = 10.0,
         default_extra: dict[str, Any] | None = None,
+        prompt_caching: bool = True,
     ) -> None:
         super().__init__(name="anthropic", default_model=default_model)
         self._base_url = base_url.rstrip("/")
         self._default_max_tokens = default_max_tokens
         self._max_retries = max_retries
         self._default_extra = dict(default_extra) if default_extra else {}
+        # Prompt caching: oznaczamy system prompt i tools markerem
+        # ``cache_control: {"type": "ephemeral"}``. Anthropic bez takiego
+        # markera NIE cachuje niczego — to opt-in per blok, nie globalna flaga.
+        # Minimalny rozmiar cachowanego bloku: 1024 tokenow (Sonnet/Opus) albo
+        # 2048 (Haiku). Ponizej progu marker jest ignorowany bez bledu.
+        self._prompt_caching = prompt_caching
+        # timeout=None -> brak read/write/pool timeoutu (tylko connect trzyma 10s).
+        # Niezbedne dla effort=high/xhigh gdzie Opus potrafi myslec >5 min.
+        http_timeout = httpx.Timeout(timeout, connect=connect_timeout)
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
-            timeout=timeout,
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": anthropic_version,
                 "content-type": "application/json",
             },
+            timeout=http_timeout,
         )
 
     def _append_message(
@@ -78,8 +103,14 @@ class AnthropicProvider(BaseProvider):
         out.append({"role": role, "content": blocks})
 
     def _map_tool_definitions(self, tools: Sequence[ToolDefinition]) -> list[dict[str, Any]]:
-        """Mapuje wspólne definicje tooli na format Anthropic `tools`."""
-        return [
+        """Mapuje wspólne definicje tooli na format Anthropic `tools`.
+
+        Gdy prompt caching jest wlaczony, dodaje ``cache_control`` tylko do
+        OSTATNIEGO toola — Anthropic cachuje wtedy caly blok tool definitions
+        jako jeden prefix (nie kazdy tool z osobna, co by marnowalo limit 4
+        cache breakpointow per request).
+        """
+        mapped = [
             {
                 "name": tool.function.name,
                 "description": tool.function.description,
@@ -87,6 +118,9 @@ class AnthropicProvider(BaseProvider):
             }
             for tool in tools
         ]
+        if mapped and self._prompt_caching:
+            mapped[-1]["cache_control"] = {"type": "ephemeral"}
+        return mapped
 
     def _map_tool_choice(self, request: ChatRequest) -> dict[str, Any] | None:
         """Mapuje wspólne `tool_choice` na format Anthropic."""
@@ -203,7 +237,19 @@ class AnthropicProvider(BaseProvider):
         }
 
         if system is not None:
-            payload["system"] = system
+            # Anthropic cachuje system prompt TYLKO gdy jest przekazany jako
+            # lista blokow z markerem ``cache_control``. String (stary format)
+            # nie jest cachowany w ogole — nawet dla Sonnet 4.6 / Opus 4.7.
+            if self._prompt_caching:
+                payload["system"] = [
+                    {
+                        "type": "text",
+                        "text": system,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            else:
+                payload["system"] = system
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.top_p is not None:
@@ -258,7 +304,10 @@ class AnthropicProvider(BaseProvider):
                 await asyncio.sleep(min(2**attempt, 8))
 
         if last_error is not None:
-            raise RuntimeError(f"Blad komunikacji z Anthropic API: {last_error}") from last_error
+            detail = _describe_httpx_error(last_error)
+            raise RuntimeError(
+                f"Blad komunikacji z Anthropic API: {detail}"
+            ) from last_error
         raise RuntimeError("Anthropic API chwilowo niedostepne po wyczerpaniu retry")
 
     def _extract_error_message(self, response: httpx.Response) -> str:
@@ -327,13 +376,29 @@ class AnthropicProvider(BaseProvider):
         if isinstance(usage_data, dict):
             input_tokens = usage_data.get("input_tokens")
             output_tokens = usage_data.get("output_tokens")
-            total_tokens = None
-            if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-                total_tokens = input_tokens + output_tokens
+            cache_creation = usage_data.get("cache_creation_input_tokens")
+            cache_read = usage_data.get("cache_read_input_tokens")
+
+            # Anthropic raportuje ``input_tokens`` BEZ tokenow cachowanych —
+            # pelny input to suma wszystkich trzech pol. total_tokens liczymy
+            # tak, zeby uzytkownik widzial realny "rozmiar" requestu.
+            components: list[int] = []
+            if isinstance(input_tokens, int):
+                components.append(input_tokens)
+            if isinstance(output_tokens, int):
+                components.append(output_tokens)
+            if isinstance(cache_creation, int):
+                components.append(cache_creation)
+            if isinstance(cache_read, int):
+                components.append(cache_read)
+            total_tokens = sum(components) if components else None
+
             usage = UsageStats(
                 input_tokens=input_tokens if isinstance(input_tokens, int) else None,
                 output_tokens=output_tokens if isinstance(output_tokens, int) else None,
                 total_tokens=total_tokens,
+                cache_creation_input_tokens=cache_creation if isinstance(cache_creation, int) else None,
+                cache_read_input_tokens=cache_read if isinstance(cache_read, int) else None,
             )
 
         return ProviderResult(

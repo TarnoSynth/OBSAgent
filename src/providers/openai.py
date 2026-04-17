@@ -36,9 +36,15 @@ class OpenAIProvider(BaseProvider):
         api_key: str,
         default_model: str,
         base_url: str | None = None,
+        timeout: float | None = None,
     ) -> None:
         super().__init__(name="openai", default_model=default_model)
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        self._client = AsyncOpenAI(**client_kwargs)
 
     @staticmethod
     def _get_field(obj: Any, name: str) -> Any:

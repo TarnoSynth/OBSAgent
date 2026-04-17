@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from dotenv import load_dotenv
@@ -13,6 +13,9 @@ from .base import BaseProvider
 from .anthropic import AnthropicProvider
 from .openai import OpenAIProvider
 from .openrouter import OpenRouterProvider
+
+if TYPE_CHECKING:
+    from logs.run_logger import RunLogger
 
 
 def _project_root() -> Path:
@@ -29,14 +32,51 @@ def load_config_dict(path: Path | str) -> dict[str, Any]:
     return raw
 
 
-def build_provider(config_path: Path | str | None = None) -> BaseProvider:
+def _parse_timeout(raw: Any, field: str) -> float | None:
+    """Normalizuje wpis ``timeout`` z configu.
+
+    - ``None`` / brak / jawne ``null`` w YAML -> ``None`` (bez limitu).
+    - liczba > 0 -> float (sekundy).
+    - inne wartosci rzucaja ``ValueError`` z nazwa pola.
+    """
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"config: {field} musi byc liczba (sekundy) albo null"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"config: {field} musi byc dodatnia liczba albo null (bez limitu)"
+        )
+    return value
+
+
+def build_provider(
+    config_path: Path | str | None = None,
+    *,
+    run_logger: "RunLogger | None" = None,
+) -> BaseProvider:
     """
     Czyta ``provider`` i ``providers.<nazwa>.model`` z YAML.
     Klucze API z ``.env`` (po ``load_dotenv()``).
+
+    Jezeli ``run_logger`` jest podany, zwraca provider owiniety w
+    ``LoggingProvider`` — kazde wywolanie ``complete()`` produkuje
+    strukturalne eventy ``llm.call.started/ok/failed``.
     """
     load_dotenv()
     path = Path(config_path) if config_path else _project_root() / "config.yaml"
     cfg = load_config_dict(path)
+
+    def _finalize(provider: BaseProvider) -> BaseProvider:
+        if run_logger is None:
+            return provider
+        # Lokalny import — nie wymuszamy zaleznosci od logs/ gdy user nie chce logowac.
+        from logs.provider_logger import LoggingProvider
+        return LoggingProvider(provider, run_logger)
 
     name = cfg.get("provider")
     if not name or not isinstance(name, str):
@@ -56,7 +96,18 @@ def build_provider(config_path: Path | str | None = None) -> BaseProvider:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("Brak OPENAI_API_KEY — ustaw w .env lub środowisku")
-        return OpenAIProvider(api_key=api_key, default_model=str(model))
+
+        base_url = section.get("base_url")
+        timeout = _parse_timeout(section.get("timeout"), "providers.openai.timeout")
+
+        return _finalize(
+            OpenAIProvider(
+                api_key=api_key,
+                default_model=str(model),
+                base_url=str(base_url) if base_url else None,
+                timeout=timeout,
+            )
+        )
 
     if name == "anthropic":
         section = providers.get("anthropic")
@@ -112,10 +163,43 @@ def build_provider(config_path: Path | str | None = None) -> BaseProvider:
                 raise ValueError(
                     "config: providers.anthropic.max_tokens musi byc liczba calkowita"
                 ) from exc
+
+        base_url = section.get("base_url")
+        if base_url is not None:
+            kwargs["base_url"] = str(base_url)
+
+        anthropic_version = section.get("anthropic_version")
+        if anthropic_version is not None:
+            kwargs["anthropic_version"] = str(anthropic_version)
+
+        max_retries_raw = section.get("max_retries")
+        if max_retries_raw is not None:
+            try:
+                kwargs["max_retries"] = int(max_retries_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "config: providers.anthropic.max_retries musi byc liczba calkowita"
+                ) from exc
+            if kwargs["max_retries"] < 0:
+                raise ValueError("config: providers.anthropic.max_retries musi byc >= 0")
+
+        timeout = _parse_timeout(
+            section.get("timeout"), "providers.anthropic.timeout"
+        )
+        kwargs["timeout"] = timeout
+
+        prompt_caching_raw = section.get("prompt_caching")
+        if prompt_caching_raw is not None:
+            if not isinstance(prompt_caching_raw, bool):
+                raise ValueError(
+                    "config: providers.anthropic.prompt_caching musi byc bool (true/false)"
+                )
+            kwargs["prompt_caching"] = prompt_caching_raw
+
         if default_extra:
             kwargs["default_extra"] = default_extra
 
-        return AnthropicProvider(**kwargs)
+        return _finalize(AnthropicProvider(**kwargs))
 
     if name == "openrouter":
         section = providers.get("openrouter")
@@ -132,20 +216,17 @@ def build_provider(config_path: Path | str | None = None) -> BaseProvider:
         base_url = section.get("base_url")
         http_referer = section.get("http_referer") or os.environ.get("OPENROUTER_HTTP_REFERER")
         app_title = section.get("title") or os.environ.get("OPENROUTER_TITLE")
-        timeout_raw = section.get("timeout", 60.0)
+        timeout = _parse_timeout(section.get("timeout"), "providers.openrouter.timeout")
 
-        try:
-            timeout = float(timeout_raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("config: providers.openrouter.timeout musi byc liczba") from exc
-
-        return OpenRouterProvider(
-            api_key=api_key,
-            default_model=str(model),
-            base_url=str(base_url) if base_url else "https://openrouter.ai/api/v1",
-            http_referer=str(http_referer) if http_referer else None,
-            app_title=str(app_title) if app_title else None,
-            timeout=timeout,
+        return _finalize(
+            OpenRouterProvider(
+                api_key=api_key,
+                default_model=str(model),
+                base_url=str(base_url) if base_url else "https://openrouter.ai/api/v1",
+                http_referer=str(http_referer) if http_referer else None,
+                app_title=str(app_title) if app_title else None,
+                timeout=timeout,
+            )
         )
 
     raise NotImplementedError(f"Provider '{name}' nie jest jeszcze zaimplementowany w fabryce")

@@ -71,11 +71,23 @@ class ToolCall(BaseModel):
 
 
 class UsageStats(BaseModel):
-    """Zużycie tokenów po stronie API (jeśli zwrócone)."""
+    """Zużycie tokenów po stronie API (jeśli zwrócone).
+
+    ``cache_creation_input_tokens`` i ``cache_read_input_tokens`` dotycza
+    prompt cachingu Anthropica: ``creation`` to tokeny zapisane do cache
+    w tym wywolaniu (koszt 1.25x), ``read`` to tokeny odczytane z cache
+    (koszt 0.1x). Dla OpenAI/OpenRouter pozostaja ``None``.
+
+    Wazne: Anthropic raportuje ``input_tokens`` jako liczbe tokenow, ktore
+    NIE byly ani cache-read ani cache-create. Pelna liczba tokenow
+    wejsciowych to suma wszystkich trzech pol.
+    """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
 
 class ChatRequest(BaseModel):

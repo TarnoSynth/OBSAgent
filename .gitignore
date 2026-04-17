@@ -9,8 +9,10 @@ __pycache__/
 .venv/
 venv/
 
-# Logi
-logs/
+# Logi biegow agenta \u2014 kod modulu logs/ jest trackowany, same pliki nie.
+logs/runs/
+logs/runs/*.jsonl
+logs/runs/*.log
 
 # Stan agenta (persystencja miedzy biegami) — lokalny per maszyna
 .agent-state.json

@@ -26,12 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 
+from logs import RunLogger, configure_stdlib_logging
 from src.agent import (
     Agent,
     AgentResponse,
@@ -48,14 +51,63 @@ from src.git.models import CommitInfo
 logger = logging.getLogger(__name__)
 console = Console()
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
-def _configure_logging() -> None:
-    """Loguje na stderr na poziomie WARNING \u2014 szczegoly i tak lecą do rich UI."""
 
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
+def _load_logs_config(config_path: Path) -> dict[str, object]:
+    """Czyta sekcje ``logs:`` z YAML. Brak -> pusty dict.
+
+    Defensywnie — gdy configu nie ma albo jest uszkodzony, zwraca ``{}``
+    i pozwala main() wyswietlic wlasny komunikat o brakujacym configu.
+    """
+    if not config_path.is_file():
+        return {}
+    try:
+        import yaml
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    logs_cfg = raw.get("logs") if isinstance(raw, dict) else None
+    return logs_cfg if isinstance(logs_cfg, dict) else {}
+
+
+def _resolve_log_dir(logs_cfg: dict[str, object]) -> Path:
+    """Buduje absolutny katalog logow z configu (default ``logs/runs``)."""
+    raw = logs_cfg.get("dir") if isinstance(logs_cfg, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = PROJECT_ROOT / candidate
+        return candidate
+    return PROJECT_ROOT / "logs" / "runs"
+
+
+def _level_from_config(raw: object, fallback: int) -> int:
+    """Mapuje stringa ``"INFO"`` / ``"WARNING"`` itp. na wartosc z ``logging``."""
+    if isinstance(raw, str):
+        level = logging.getLevelName(raw.strip().upper())
+        if isinstance(level, int):
+            return level
+    if isinstance(raw, int):
+        return raw
+    return fallback
+
+
+def _setup_logging(logs_cfg: dict[str, object], log_dir: Path) -> None:
+    """Konfiguracja stdlib logging — poziomy z ``config.yaml -> logs``.
+
+    JSONL leci osobno przez ``RunLogger`` (structured events).
+    Ten setup zajmuje sie tylko klasycznymi ``logger.info/warning/error``.
+    """
+
+    stdlib_level = _level_from_config(logs_cfg.get("stdlib_level"), logging.INFO)
+    console_level = _level_from_config(logs_cfg.get("console_level"), logging.WARNING)
+
+    configure_stdlib_logging(
+        level=stdlib_level,
+        console_level=console_level,
+        log_dir=log_dir,
     )
 
 
@@ -137,6 +189,7 @@ async def _process_single_commit(
     state,
     project_commit: CommitInfo,
     renderer: PreviewRenderer,
+    run_logger: RunLogger,
 ) -> bool:
     """Przetwarza **jeden** commit projektu end-to-end.
 
@@ -156,6 +209,12 @@ async def _process_single_commit(
         subject = project_commit.message.splitlines()[0][:120] if project_commit.message else "(bez wiadomosci)"
         console.print(f"[dim]{project_commit.date.isoformat()} \u2022 {project_commit.author}[/]")
         console.print(f"[white]{subject}[/]\n")
+
+        run_logger.log_commit_started(
+            sha=project_commit.sha,
+            author=project_commit.author,
+            subject=subject,
+        )
 
         knowledge = agent.scan_vault()
         vault_changes, vault_changed_notes = agent.collect_vault_changes(state)
@@ -195,6 +254,17 @@ async def _process_single_commit(
                 f"([dim]{chunk.hunk_count} hunk(\u00f3w), {chunk.line_count}L, {src}{split_tag}[/])"
             )
 
+            run_logger.log_chunk(
+                sha=project_commit.sha,
+                chunk_id=chunk.chunk_id,
+                chunk_idx=idx,
+                chunk_total=total,
+                files=list(chunk.file_paths),
+                hunk_count=chunk.hunk_count,
+                line_count=chunk.line_count,
+                cache_hit=cache_hit,
+            )
+
         try:
             response: AgentResponse = await agent.propose_actions(
                 chunked_commit=chunked_commit,
@@ -205,7 +275,15 @@ async def _process_single_commit(
             )
         except RuntimeError as exc:
             console.print(f"[red]Blad podczas wywolywania AI: {exc}[/]")
+            run_logger.log(
+                f"AI call nie powiodlo sie: {exc}",
+                level="error",
+                sha=project_commit.sha,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             if not ask_retry():
+                run_logger.log_commit_rejected(sha=project_commit.sha, reason="user_abort_after_ai_error")
                 return False
             continue
 
@@ -213,6 +291,7 @@ async def _process_single_commit(
             renderer.render_empty_response(response)
             renderer.info("Zaliczam commit do processed (pusty plan = commit nic nie wnosi).")
             agent.mark_commit_processed(state, project_sha=project_commit.sha, vault_commit_sha=None)
+            run_logger.log_commit_processed(sha=project_commit.sha, vault_sha=None)
             return True
 
         plans: list[PlannedVaultWrite] = agent.plan_post_updates(response, knowledge)
@@ -250,6 +329,7 @@ async def _process_single_commit(
         _render_pending_review_banner(batch, vault_path=agent.config.vault_path)
 
         if ask_accept_pending():
+            run_logger.log_pending(approved=True, files=len(batch.clean_by_path))
             console.print("[cyan]Sciagam diff-view (red+green) z vaulta\u2026[/]")
             rewritten = agent.finalize_pending(batch)
             if rewritten:
@@ -272,8 +352,14 @@ async def _process_single_commit(
                     summary=response.summary,
                 )
                 console.print(f"[green]Zacommitowano vault: {vault_sha[:7]}[/]")
+                run_logger.log_vault_commit(sha=vault_sha)
             except RuntimeError as exc:
                 console.print(f"[red]Commit vaulta sie nie udal: {exc}[/]")
+                run_logger.log(
+                    f"vault commit failed: {exc}",
+                    level="error",
+                    sha=project_commit.sha,
+                )
                 console.print(
                     "[yellow]Pliki sa juz clean na dysku, ale nie trafily do Gita. "
                     "Mozesz zacommitowac recznie albo odrzucic i sprobowac ponownie.[/]"
@@ -287,18 +373,21 @@ async def _process_single_commit(
                 project_sha=project_commit.sha,
                 vault_commit_sha=vault_sha,
             )
+            run_logger.log_commit_processed(sha=project_commit.sha, vault_sha=vault_sha)
             return True
 
+        run_logger.log_pending(approved=False, files=len(batch.clean_by_path))
         console.print("[yellow]Odrzucam \u2014 cofam vault do stanu sprzed propozycji\u2026[/]")
         restored = agent.rollback_pending(batch)
         console.print(f"[green]Przywrocono {len(restored)} plikow.[/]")
         if ask_retry():
             console.print("[cyan]Powtarzam generacje dla tego samego commita\u2026[/]\n")
             continue
+        run_logger.log_commit_rejected(sha=project_commit.sha, reason="user_rejected_pending")
         return False
 
 
-async def _run() -> int:
+async def _run(run_logger: RunLogger) -> int:
     """Glowna korutyna \u2014 buduje agenta, iteruje po pending commitach.
 
     Zwraca kod wyjscia dla ``sys.exit``:
@@ -308,29 +397,47 @@ async def _run() -> int:
     - ``1`` \u2014 blad krytyczny (niepoprawny config, brak remote, itd.)
     """
 
-    project_root = Path(__file__).resolve().parent
-    config_path = project_root / "config.yaml"
+    config_path = CONFIG_PATH
 
     if not config_path.is_file():
         console.print(f"[red]Brak pliku konfiguracyjnego: {config_path}[/]")
         console.print("[dim]Skopiuj config/config.example.yaml \u2192 config.yaml i uzupelnij sciezki.[/]")
+        run_logger.log("missing_config", level="error", path=str(config_path))
         return 1
 
     try:
-        agent = Agent.from_config(config_path)
+        agent = Agent.from_config(config_path, run_logger=run_logger)
     except (ValueError, RuntimeError) as exc:
         console.print(f"[red]Blad inicjalizacji agenta: {exc}[/]")
+        run_logger.log(
+            f"init_failed: {exc}",
+            level="error",
+            error_type=type(exc).__name__,
+        )
         return 1
 
     console.print(f"[bold]Obsidian Git Documentation Agent[/]  \u2022 provider: {agent.provider.name}")
     console.print(f"[dim]Project: {agent.config.project_repo_path}[/]")
     console.print(f"[dim]Vault:   {agent.config.vault_path}[/]\n")
 
+    run_logger.log_run_started(
+        provider=agent.provider.name,
+        model=getattr(agent.provider, "default_model", "?"),
+        effort=_read_effort_from_config(config_path, agent.provider.name),
+        project_repo=str(agent.config.project_repo_path),
+        vault=str(agent.config.vault_path),
+    )
+
     console.print("[cyan]Sync repozytoriow (pull + auto-stash)\u2026[/]")
     try:
         agent.sync_repos()
     except Exception as exc:
         console.print(f"[red]Sync repo nie powiodl sie: {exc}[/]")
+        run_logger.log(
+            f"sync_failed: {exc}",
+            level="error",
+            error_type=type(exc).__name__,
+        )
         return 1
 
     state = agent.load_state()
@@ -351,7 +458,7 @@ async def _run() -> int:
                 seen_vault_shas.add(c.sha)
                 seen_user_vault_commits.append(c)
 
-        proceed = await _process_single_commit(agent, state, commit, renderer)
+        proceed = await _process_single_commit(agent, state, commit, renderer, run_logger)
 
         knowledge = agent.scan_vault()
         agent.update_vault_snapshot(state, knowledge)
@@ -375,13 +482,62 @@ async def _run() -> int:
     return 0
 
 
-def main() -> None:
-    _configure_logging()
+def _read_effort_from_config(config_path: Path, provider_name: str) -> str | None:
+    """Best-effort — czytamy effort tylko po to zeby wrzucic do run.started.
+
+    Nie chcemy tu powielac walidacji z ``build_provider`` — jesli cokolwiek
+    padnie, zwracamy None i puszczamy dalej.
+    """
     try:
-        exit_code = asyncio.run(_run())
+        import yaml
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        section = (cfg.get("providers") or {}).get(provider_name) or {}
+        effort = section.get("effort")
+        return str(effort) if isinstance(effort, str) else None
+    except Exception:
+        return None
+
+
+def main() -> None:
+    load_dotenv()
+
+    logs_cfg = _load_logs_config(CONFIG_PATH)
+    log_dir = _resolve_log_dir(logs_cfg)
+
+    _setup_logging(logs_cfg, log_dir)
+
+    project_name = PROJECT_ROOT.name
+    verbose_cfg = bool(logs_cfg.get("verbose")) if isinstance(logs_cfg, dict) else False
+    env_verbose = os.environ.get("OBSAGENT_LOG_VERBOSE") == "1"
+    run_logger = RunLogger.create(
+        log_dir=log_dir,
+        project_name=project_name,
+        console_verbose=verbose_cfg or env_verbose,
+    )
+    console.print(
+        f"[dim]Logs: run_id=[cyan]{run_logger.run_id}[/] \u2192 {run_logger.jsonl_path}[/]"
+    )
+
+    exit_code = 0
+    try:
+        exit_code = asyncio.run(_run(run_logger))
     except KeyboardInterrupt:
         console.print("\n[yellow]Przerwano przez uzytkownika (Ctrl+C). State zostal zapisany przy ostatniej iteracji.[/]")
+        run_logger.log("interrupted", level="warning")
         exit_code = 130
+    except Exception as exc:
+        console.print(f"\n[red]Niezlapany wyjatek: {exc!r}[/]")
+        run_logger.log(
+            f"uncaught: {exc!r}",
+            level="error",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        exit_code = 1
+    finally:
+        run_logger.log_run_ended(exit_code=exit_code)
+        run_logger.close()
+
     sys.exit(exit_code)
 
 

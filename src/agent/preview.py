@@ -197,23 +197,46 @@ class PreviewRenderer:
         self.console.print(f"[green]\u2713[/green] {message}")
 
 
+_YES_TOKENS = {"t", "tak", "y", "yes", "true", "1"}
+_NO_TOKENS = {"n", "nie", "no", "false", "0"}
+
+
 def ask_confirm(prompt: str = "Zatwierdz i zacommituj?", *, default_no: bool = True) -> bool:
-    """Blokujace pytanie [T/n] na stdin. Enter = odmowa (bezpieczny default).
+    """Blokujace pytanie [T/n] na stdin. Enter = default (bezpieczny default_no).
+
+    Akceptuje tylko ``t``/``n`` (oraz aliasy: ``tak``/``nie``, ``yes``/``no``,
+    ``1``/``0``, ``true``/``false``). Kazda inna odpowiedz drukuje komunikat
+    bledu i petla pyta ponownie — **nic w vaulcie/na dysku nie jest
+    modyfikowane** w trakcie oczekiwania na poprawna odpowiedz, bo ta
+    funkcja tylko czyta stdin.
 
     :param default_no: gdy True (domyslnie), pusty input znaczy 'n'.
         Ustawienie False odwraca default (pusty = T) \u2014 rezerwujemy
         na automatyczne scenariusze, nie do zwyklego flow.
-    :return: True jesli user potwierdzil (T / t / tak / y / yes),
-        False w kazdym innym przypadku.
+    :return: True jesli user potwierdzil (t / tak / y / yes / 1 / true),
+        False jesli odrzucil (n / nie / no / 0 / false) lub nacisnal Enter
+        przy ``default_no=True``.
     """
 
     suffix = "[t/N]" if default_no else "[T/n]"
-    raw = input(f"{prompt} {suffix} ").strip().lower()
+    while True:
+        try:
+            raw = input(f"{prompt} {suffix} ").strip().lower()
+        except EOFError:
+            return not default_no
 
-    if not raw:
-        return not default_no
+        if not raw:
+            return not default_no
 
-    return raw in {"t", "tak", "y", "yes", "true", "1"}
+        if raw in _YES_TOKENS:
+            return True
+        if raw in _NO_TOKENS:
+            return False
+
+        print(
+            f"Nieprawidlowa odpowiedz: {raw!r}. Wpisz 't' (tak) albo 'n' (nie). "
+            "Enter = default. Nic nie zostalo zmienione."
+        )
 
 
 def ask_retry() -> bool:

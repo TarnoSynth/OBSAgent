@@ -43,7 +43,7 @@ class OpenRouterProvider(BaseProvider):
         base_url: str = "https://openrouter.ai/api/v1",
         http_referer: str | None = None,
         app_title: str | None = None,
-        timeout: float = 60.0,
+        timeout: float | None = None,
     ) -> None:
         super().__init__(name="openrouter", default_model=default_model)
         default_headers: dict[str, str] = {}
@@ -52,12 +52,14 @@ class OpenRouterProvider(BaseProvider):
         if app_title:
             default_headers["X-OpenRouter-Title"] = app_title
 
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url.rstrip("/"),
-            timeout=timeout,
-            default_headers=default_headers or None,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": base_url.rstrip("/"),
+            "default_headers": default_headers or None,
+        }
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        self._client = AsyncOpenAI(**client_kwargs)
 
     def _map_tool_definitions(self, tools: Sequence[ToolDefinition]) -> list[dict[str, Any]]:
         """Mapuje wspolne definicje narzedzi na format `tools` dla Chat Completions."""

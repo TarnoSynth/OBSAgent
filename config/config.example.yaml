@@ -24,9 +24,43 @@ providers:
     # Lista modeli: https://docs.anthropic.com/en/docs/about-claude/models
     model: claude-sonnet-4-20250514
 
+    # Endpoint Messages API. Zmien tylko dla proxy / gateway.
+    base_url: https://api.anthropic.com
+
+    # Header `anthropic-version`. Zmien gdy Anthropic ogłosi nowa wersje.
+    anthropic_version: "2023-06-01"
+
+    # Ile razy ponawiac 429/500/529/timeout/network. 0 = jedna proba.
+    max_retries: 3
+
+    # Timeout pojedynczego requesta do Anthropic (sekundy).
+    # null = bez limitu (zalecane gdy effort=high/xhigh/max — Claude liczy dlugo).
+    # liczba = twardy limit read-timeout (connect ma osobno 10s).
+    timeout: null
+
+    # max_tokens domyslne gdy request nie ustawia wlasnego.
+    # Zwykle nadpisywane przez ChatRequest.max_tokens z promptu.
+    # default_max_tokens: 4096
+
+    # Tryb rozumowania (effort) — Opus 4.6+/Sonnet 4.6+.
+    # Dopuszczalne: low | medium | high | xhigh | max
+    # effort: high
+
+    # Prompt caching: system prompt + tools sa oznaczane ``cache_control``,
+    # dzieki czemu kolejne wywolania w ciagu ~5 min placa 0.1x za cachowany
+    # prefix. Domyslnie true (zalecane). Wymaga >= 1024 tokenow w bloku
+    # (Sonnet/Opus) — ponizej marker jest ignorowany.
+    # prompt_caching: true
+
   openai:
     # Lista modeli: https://platform.openai.com/docs/models
     model: gpt-4o
+
+    # null = default AsyncOpenAI (api.openai.com). Zmien dla Azure / proxy.
+    base_url: null
+
+    # Timeout w sekundach. null = default SDK (~10 min).
+    timeout: null
 
   openrouter:
     # OpenRouter udostępnia modele różnych providerów pod jednym API.
@@ -34,6 +68,9 @@ providers:
     # Lista modeli: https://openrouter.ai/models
     model: anthropic/claude-sonnet-4-20250514
     base_url: https://openrouter.ai/api/v1
+
+    # Timeout w sekundach. null = default SDK (~10 min).
+    timeout: null
 
 agent:
   # Rozmiar pojedynczego chunka diffa (w liniach) wysyłanego do AI.
@@ -91,6 +128,38 @@ agent:
   # Dla typowego użycia (1-2 commity per bieg) N=20 daje 10-20 biegów historii.
   # Zakres: 1+. Domyślnie 20.
   processed_commits_window: 20
+
+  # Katalog cache chunkow diffa i podsumowan AI (relatywny do config.yaml
+  # albo absolutny). Usuwanie tego katalogu jest bezpieczne — odbuduje sie.
+  cache_dir: .agent-cache
+
+  # Prefiks wiadomosci commita vaulta robionego przez agenta.
+  # Uzywany TEZ do rozpoznawania "to byl commit agenta" przy zbieraniu
+  # recznych zmian usera w vaulcie (collect_vault_changes filtruje po prefiksie).
+  # ZMIANA tego po fakcie sprawi ze stare commity agenta beda traktowane
+  # jako commity usera — zostaw domyslna wartosc.
+  vault_commit_prefix: "Agent: sync z "
+
+vault:
+  # Nazwa globalnego indeksu w vaulcie. Plik utrzymywany przez MOCManager —
+  # agent dopisuje tam wpisy do sekcji per typ notatki.
+  index_filename: _index.md
+
+logs:
+  # Katalog plikow logow (jsonl + stdlib .log). Relatywny do roota repo agenta
+  # albo absolutny.
+  dir: logs/runs
+
+  # Poziom dla klasycznego logging.* (pliki .log). DEBUG | INFO | WARNING | ERROR
+  stdlib_level: INFO
+
+  # Poziom konsoli — co leci na stderr. Zwykle WARNING, zeby nie spamowac.
+  console_level: WARNING
+
+  # Gdy true, ConsoleSink pokazuje rowniez eventy typu llm.call.started/ok
+  # (domyslnie tylko failed + komunikaty uzytkownika).
+  # Nadpisywalne przez zmienna srodowiskowa OBSAGENT_LOG_VERBOSE=1.
+  verbose: false
 
 # Wzorce plików ignorowanych przy analizie diffów.
 # Pliki pasujące do tych wzorców nie będą wysyłane do AI.

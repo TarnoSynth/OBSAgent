@@ -26,9 +26,13 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from git import Actor, GitCommandError, Repo
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from logs.run_logger import RunLogger
 
 from src.agent.action_executor import ActionExecutionReport, ActionExecutor
 from src.agent.chunk_cache import ChunkCache
@@ -72,12 +76,16 @@ from src.providers import (
 from src.vault.manager import VaultManager
 from src.vault.models import VaultKnowledge, VaultNote
 
+from logs.context import LLMCallContext, llm_call_context
+
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_LANGUAGE = "pl"
 DEFAULT_PROJECT_NAME_FALLBACK = "project"
+DEFAULT_VAULT_COMMIT_PREFIX = "Agent: sync z "
+DEFAULT_VAULT_INDEX_FILENAME = "_index.md"
 
 
 @dataclass(slots=True)
@@ -95,6 +103,8 @@ class AgentConfig:
     max_retries: int
     default_commits: int
     project_name: str
+    vault_commit_prefix: str
+    vault_index_filename: str
 
 
 class Agent:
@@ -127,6 +137,7 @@ class Agent:
         git_context_builder: GitContextBuilder,
         state_store: AgentStateStore,
         chunk_cache: ChunkCache,
+        run_logger: "RunLogger | None" = None,
     ) -> None:
         self.config = config
         self.provider = provider
@@ -139,6 +150,7 @@ class Agent:
         self.state_store = state_store
         self.chunk_cache = chunk_cache
         self.action_executor = ActionExecutor(vault_manager)
+        self.run_logger = run_logger
 
         self._system_prompt_cache: str | None = None
         self._chunk_instruction_prompt_cache: str | None = None
@@ -146,8 +158,18 @@ class Agent:
         self._templates_cache: dict[str, str] | None = None
 
     @classmethod
-    def from_config(cls, config_path: str | Path) -> "Agent":
-        """Factory budujace pelny graf zaleznosci z ``config.yaml`` + ``.env``."""
+    def from_config(
+        cls,
+        config_path: str | Path,
+        *,
+        run_logger: "RunLogger | None" = None,
+    ) -> "Agent":
+        """Factory budujace pelny graf zaleznosci z ``config.yaml`` + ``.env``.
+
+        ``run_logger`` jest opcjonalny — gdy przekazany, provider zostanie
+        owiniety w ``LoggingProvider`` i Agent bedzie zglaszal ustrukturyzowane
+        eventy (``commit.started``, ``llm.call.*``, itp.).
+        """
 
         resolved = Path(config_path).expanduser().resolve()
         cfg = load_config_dict(resolved)
@@ -183,6 +205,29 @@ class Agent:
             agent_cfg.get("project_name") or Path(project_repo).name or DEFAULT_PROJECT_NAME_FALLBACK
         )
 
+        vault_commit_prefix_raw = agent_cfg.get("vault_commit_prefix")
+        if vault_commit_prefix_raw is None:
+            vault_commit_prefix = DEFAULT_VAULT_COMMIT_PREFIX
+        else:
+            if not isinstance(vault_commit_prefix_raw, str) or not vault_commit_prefix_raw:
+                raise ValueError(
+                    "config: agent.vault_commit_prefix musi byc niepustym stringiem"
+                )
+            vault_commit_prefix = vault_commit_prefix_raw
+
+        vault_cfg = cfg.get("vault") or {}
+        if not isinstance(vault_cfg, dict):
+            raise ValueError("config: sekcja 'vault' musi byc mapa")
+        index_filename_raw = vault_cfg.get("index_filename")
+        if index_filename_raw is None:
+            vault_index_filename = DEFAULT_VAULT_INDEX_FILENAME
+        else:
+            if not isinstance(index_filename_raw, str) or not index_filename_raw.strip():
+                raise ValueError(
+                    "config: vault.index_filename musi byc niepustym stringiem"
+                )
+            vault_index_filename = index_filename_raw.strip()
+
         config = AgentConfig(
             config_path=resolved,
             project_repo_path=Path(project_repo).expanduser().resolve(),
@@ -191,9 +236,11 @@ class Agent:
             max_retries=max_retries,
             default_commits=default_commits,
             project_name=project_name,
+            vault_commit_prefix=vault_commit_prefix,
+            vault_index_filename=vault_index_filename,
         )
 
-        provider = build_provider(resolved)
+        provider = build_provider(resolved, run_logger=run_logger)
         return cls(
             config=config,
             provider=provider,
@@ -205,6 +252,7 @@ class Agent:
             git_context_builder=GitContextBuilder.from_config(resolved),
             state_store=AgentStateStore.from_config(resolved),
             chunk_cache=ChunkCache.from_config(resolved),
+            run_logger=run_logger,
         )
 
     def sync_repos(self) -> None:
@@ -318,7 +366,7 @@ class Agent:
 
         user_commits = [
             c for c in raw_commits
-            if not c.message.strip().startswith("Agent: sync z ")
+            if not c.message.strip().startswith(self.config.vault_commit_prefix)
         ]
         user_commits.sort(key=lambda c: c.date)
 
@@ -436,8 +484,15 @@ class Agent:
                 parallel_tool_calls=False,
             )
 
+            call_ctx = LLMCallContext(
+                phase="SMALL",
+                commit_sha=chunked_commit.commit.sha,
+                attempt=attempt + 1,
+                files=tuple(c.path for c in chunked_commit.commit.changes),
+            )
             try:
-                result = await self.provider.complete(request)
+                with llm_call_context(call_ctx):
+                    result = await self.provider.complete(request)
                 return self._parse_agent_response(result)
             except _AgentResponseValidationError as exc:
                 last_exc = exc
@@ -535,8 +590,17 @@ class Agent:
             tool_choice=None,
         )
 
+        call_ctx = LLMCallContext(
+            phase="CHUNK_SUMMARY",
+            commit_sha=chunked_commit.commit.sha,
+            chunk_idx=chunk.chunk_idx,
+            chunk_total=chunk.total_chunks,
+            chunk_id=chunk.chunk_id,
+            files=tuple(chunk.file_paths),
+        )
         try:
-            result = await self.provider.complete(request)
+            with llm_call_context(call_ctx):
+                result = await self.provider.complete(request)
         except Exception as exc:
             files_dbg = ",".join(chunk.file_paths) or "(none)"
             raise RuntimeError(
@@ -601,8 +665,16 @@ class Agent:
                 parallel_tool_calls=False,
             )
 
+            call_ctx = LLMCallContext(
+                phase="FINALIZE",
+                commit_sha=chunked_commit.commit.sha,
+                chunk_total=chunked_commit.total_chunks,
+                attempt=attempt + 1,
+                files=tuple(c.path for c in chunked_commit.commit.changes),
+            )
             try:
-                result = await self.provider.complete(request)
+                with llm_call_context(call_ctx):
+                    result = await self.provider.complete(request)
                 return self._parse_agent_response(result)
             except _AgentResponseValidationError as exc:
                 last_exc = exc
@@ -631,7 +703,12 @@ class Agent:
 
         if not response.actions:
             return []
-        return plan_post_action_updates(response.actions, self.vault_manager, knowledge)
+        return plan_post_action_updates(
+            response.actions,
+            self.vault_manager,
+            knowledge,
+            index_path=self.config.vault_index_filename,
+        )
 
     def execute_plan(
         self,
@@ -724,7 +801,7 @@ class Agent:
             raise RuntimeError(f"git add zwrocil blad w vaulcie: {exc}") from exc
 
         short_sha = project_commit.sha[:7]
-        subject = f"Agent: sync z {self.config.project_name}@{short_sha}"
+        subject = f"{self.config.vault_commit_prefix}{self.config.project_name}@{short_sha}"
         files_list = "\n".join(f"- {p}" for p in touched)
         body = f"{summary}\n\nZmienione pliki:\n{files_list}"
         message = f"{subject}\n\n{body}"
