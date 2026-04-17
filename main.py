@@ -1,266 +1,272 @@
-"""Krótki przykład użycia providerów z tool callingiem.
+"""Obsidian Git Documentation Agent \u2014 punkt wejscia z petla iteracyjna.
 
-Uruchom:
-    python main.py
+**Flow:** dla kazdego nieprzetworzonego commita projektu, od najstarszego:
 
-Przed uruchomieniem ustaw w `config.yaml` wybranego providera, np. `openai`,
-oraz odpowiedni klucz API w `.env`.
+1. Pull obu repo (``Agent.sync_repos``)
+2. Skan vaulta i zbiorka recznych zmian usera (``Agent.scan_vault`` + ``collect_vault_changes``)
+3. Chunkuj diff commita (``Agent.prepare_commit_for_ai`` \u2192 ``ChunkedCommit``)
+4. Wywolanie AI z tool callingiem (``Agent.propose_actions``):
+   - Small commit: jeden request + ``submit_plan``
+   - Duzy commit: multi-turn chunk-summary (cache po sha+path+idx) \u2192 FINALIZE + ``submit_plan``
+5. Pre-compute planow MOC/indeksu (``Agent.plan_post_updates``)
+6. Preview w terminalu (``PreviewRenderer.render_plan``)
+7. Pytanie usera:
+   - ``[T]`` \u2192 aplikuj akcje + plany, zacommituj vault, dopisz do state
+   - ``[n]`` \u2192 stop; pytanie o retry tego samego commita; jesli nie \u2014 koniec biegu
 
-Warstwa Git (`GitReader`, `GitContextBuilder`) przy starcie wypisuje pelny raport
-tekstowy na stdout (gałąź, drzewo plikow, lista commitow, diffy, filtr since_last),
-potem asercje; repozytorium: katalog z `main.py`.
+**Zasada bezpieczenstwa:** ``Agent.commit_vault`` jest **jedynym miejscem**
+gdzie ten proces robi commit na repo vaulta. Nigdy nie woluje ``push``.
+
+Konfiguracja przez ``config.yaml`` + ``.env`` (klucze API). Petla nie
+rusza sie z miejsca bez zatwierdzenia usera \u2014 to celowa decyzja
+architektoniczna (zobacz ROADMAP_AGENT.md, Faza 6).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-from datetime import datetime
+import logging
+import sys
 from pathlib import Path
-from typing import Any
 
-from src.agent import GitContextBuilder
-from src.git.models import CommitInfo, CommitStats, FileChange
-from src.git.reader import GitReader
-from src.providers import (
-    BaseProvider,
-    ChatMessage,
-    ChatRequest,
-    MessageRole,
-    ToolDefinition,
-    ToolFunctionDefinition,
-    build_provider,
-)
+from rich.console import Console
+
+from src.agent import Agent, AgentResponse, PreviewRenderer, ask_confirm, ask_retry
+from src.agent.action_executor import ActionExecutionReport
+from src.agent.models_chunks import ChunkedCommit, DiffChunk
+from src.agent.moc_planner import PlannedVaultWrite
+from src.git.models import CommitInfo
+
+logger = logging.getLogger(__name__)
+console = Console()
 
 
-def _short_preview(text: str, *, max_lines: int = 12) -> str:
-    lines = text.splitlines()
-    if len(lines) <= max_lines:
-        return text if text else "(pusty)"
-    head = "\n".join(lines[:max_lines])
-    return f"{head}\n... (+{len(lines) - max_lines} linii)"
+def _configure_logging() -> None:
+    """Loguje na stderr na poziomie WARNING \u2014 szczegoly i tak lecą do rich UI."""
 
-
-def _run_git_reader_smoke_test(*, config_path: Path, repo_path: Path) -> None:
-    """Sprawdza zwrotki GitReader i GitContextBuilder: asercje + pelny wydruk wynikow na stdout."""
-
-    print()
-    print("=" * 72)
-    print("  GIT READER — wyniki sprawdzenia (czytelny raport)")
-    print("=" * 72)
-    print(f"repo_path: {repo_path.resolve()}")
-    print(f"config:    {config_path.resolve()}")
-    print()
-
-    reader = GitReader(repo_path)
-    branch = reader.get_current_branch()
-    assert isinstance(branch, str) and branch.strip() != "", "get_current_branch: pusty string"
-    print(f"[get_current_branch] -> {branch!r}")
-    print()
-
-    tree = reader.get_file_tree()
-    assert isinstance(tree, list), "get_file_tree: oczekiwano list[str]"
-    assert all(isinstance(p, str) for p in tree), "get_file_tree: elementy musza byc str"
-    assert tree == sorted(tree), "get_file_tree: lista powinna byc posortowana"
-    assert any(p.replace("\\", "/").endswith("main.py") for p in tree), (
-        "get_file_tree: brak main.py — czy repo_path wskazuje na ten projekt?"
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
     )
-    print(f"[get_file_tree] liczba plikow (po filtrze): {len(tree)}")
-    print("  pierwsze 15 sciezek:")
-    for p in tree[:15]:
-        print(f"    - {p}")
-    if len(tree) > 15:
-        print(f"    ... i jeszcze {len(tree) - 15} plikow")
-    print()
 
-    recent = reader.get_recent_commits(since=None, limit=5)
-    assert isinstance(recent, list), "get_recent_commits: oczekiwano list[CommitInfo]"
-    print(f"[get_recent_commits(limit=5)] zwrocono {len(recent)} commitow")
-    for i, item in enumerate(recent, start=1):
-        assert isinstance(item, CommitInfo), "get_recent_commits: element musi byc CommitInfo"
-        assert isinstance(item.sha, str) and len(item.sha) >= 7, "CommitInfo.sha"
-        assert isinstance(item.message, str), "CommitInfo.message"
-        assert isinstance(item.author, str) and item.author != "", "CommitInfo.author"
-        assert isinstance(item.date, datetime), "CommitInfo.date"
-        assert isinstance(item.stats, CommitStats), "CommitInfo.stats"
-        assert item.stats.insertions >= 0 and item.stats.deletions >= 0, "CommitInfo.stats liczby"
-        assert isinstance(item.changes, list), "CommitInfo.changes"
-        msg_first = item.message.strip().split("\n", 1)[0][:80]
-        print(f"  --- commit #{i} ---")
-        print(f"  sha:     {item.sha}")
-        print(f"  data:    {item.date.isoformat()}")
-        print(f"  autor:   {item.author}")
-        print(f"  wiadomosc (1. linia): {msg_first!r}")
-        print(
-            f"  stats:   +{item.stats.insertions} / -{item.stats.deletions} "
-            f"(insertions / deletions)"
-        )
-        print(f"  pliki ({len(item.changes)}) — bez diffow (lekkie):")
-        for ch in item.changes:
-            assert isinstance(ch, FileChange), "zmiana musi byc FileChange"
-            assert isinstance(ch.path, str) and ch.path != "", "FileChange.path"
-            assert ch.diff_text == "", "get_recent_commits: lekkie commity bez diff_text"
-            extra = f" <- {ch.old_path!r}" if ch.old_path else ""
-            print(f"    [{ch.change_type.value}] {ch.path}{extra}")
-        print()
 
-    if recent:
-        first_sha = recent[0].sha
-        diffs = reader.get_commit_diff(first_sha)
-        assert isinstance(diffs, list), "get_commit_diff: oczekiwano list[FileChange]"
-        print(f"[get_commit_diff({first_sha[:7]}...)] plikow z patchem: {len(diffs)}")
-        for fc in diffs:
-            assert isinstance(fc, FileChange), "get_commit_diff: element FileChange"
-            assert isinstance(fc.diff_text, str), "FileChange.diff_text musi byc str"
-            n_lines = len(fc.diff_text.splitlines()) if fc.diff_text else 0
-            print(f"  --- {fc.path} ---")
-            print(f"  typ: {fc.change_type.value}  |  linii w diffie: {n_lines}")
-            if fc.old_path:
-                print(f"  stara sciezka: {fc.old_path}")
-            print("  podglad diffa:")
-            for line in _short_preview(fc.diff_text, max_lines=14).splitlines():
-                print(f"    {line}")
-            print()
+async def _process_single_commit(
+    agent: Agent,
+    state,
+    project_commit: CommitInfo,
+    renderer: PreviewRenderer,
+) -> bool:
+    """Przetwarza **jeden** commit projektu end-to-end.
 
-        since_last = reader.get_commits_since_last_run([first_sha])
-        assert isinstance(since_last, list), "get_commits_since_last_run: lista"
-        assert all(c.sha != first_sha for c in since_last), (
-            "get_commits_since_last_run: przetworzony sha nie powinien sie powtorzyc"
-        )
-        print(
-            "[get_commits_since_last_run(processed=[najnowszy_sha])] "
-            f"bez przetworzonego: {len(since_last)} commitow"
-        )
-        for j, c in enumerate(since_last[:8], start=1):
-            one = c.message.strip().split("\n", 1)[0][:60]
-            print(f"  {j}. {c.sha[:7]}...  {one!r}")
-        if len(since_last) > 8:
-            print(f"  ... i jeszcze {len(since_last) - 8}")
-        print()
+    Zwraca:
 
-        builder = GitContextBuilder.from_config(config_path)
-        prepared = builder.prepare_commit(recent[0])
-        assert isinstance(prepared, CommitInfo), "prepare_commit: CommitInfo"
-        assert prepared.sha == recent[0].sha
-        print(
-            f"[GitContextBuilder.prepare_commit] max_diff_lines={builder.max_diff_lines} "
-            "(kopie pod AI — obciete diffy)"
-        )
-        for fc in prepared.changes:
-            line_count = len(fc.diff_text.splitlines()) if fc.diff_text else 0
-            assert line_count <= builder.max_diff_lines + 1, (
-                "po obcieciu diff nie powinien przekroczyc max_diff_lines (+ ewentualna linia z komunikatem)"
+    - ``True``  \u2014 commit zostal przetworzony (zaakceptowany lub pominiety,
+      w obu przypadkach dopisany do state); petla moze iterowac dalej.
+    - ``False`` \u2014 user odrzucil i nie chce retry; petla konczy sie teraz.
+
+    Retry jest **wewnetrzny** \u2014 przy odrzuceniu tego commita pytamy o
+    ponowne wygenerowanie planu dla **tego samego** commita. Nie dotyczy
+    retry walidacji AI (ten siedzi w ``Agent.propose_actions``).
+    """
+
+    while True:
+        console.rule(f"[bold cyan]Commit projektu: {project_commit.sha[:7]}")
+        subject = project_commit.message.splitlines()[0][:120] if project_commit.message else "(bez wiadomosci)"
+        console.print(f"[dim]{project_commit.date.isoformat()} \u2022 {project_commit.author}[/]")
+        console.print(f"[white]{subject}[/]\n")
+
+        knowledge = agent.scan_vault()
+        vault_changes, vault_changed_notes = agent.collect_vault_changes(state)
+        chunked_commit: ChunkedCommit = agent.prepare_commit_for_ai(project_commit)
+
+        if chunked_commit.is_small():
+            console.print(
+                f"[cyan]Commit maly ({chunked_commit.total_chunks} chunk) \u2014 jeden request do AI\u2026[/]"
             )
-            print(f"  {fc.path}: {line_count} linii w diff_text (po obcieciu)")
-        print()
-
-    print("=" * 72)
-    print("  Koniec raportu Git — asercje przeszly, dane powyzej to faktyczne zwrotki API.")
-    print("=" * 72)
-    print()
-
-
-def _tool_echo(*, text: str) -> str:
-    return text
-
-
-def _safe_json_loads(raw: str) -> Any:
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-
-
-async def _run_tool_demo(provider: BaseProvider) -> None:
-    """Minimalny przepływ: assistant -> tool -> assistant."""
-    # Minimalne narzedzie do testu E2E tool callingu.
-    tools = [
-        ToolDefinition(
-            function=ToolFunctionDefinition(
-                name="echo",
-                description="Zwraca przekazany tekst (narzedzie testowe).",
-                parameters={
-                    "type": "object",
-                    "properties": {"text": {"type": "string"}},
-                    "required": ["text"],
-                    "additionalProperties": False,
-                },
+        else:
+            console.print(
+                f"[cyan]Commit duzy \u2014 {chunked_commit.total_chunks} chunkow, tryb multi-turn "
+                f"(chunk-summary + FINALIZE, cache w .agent-cache/)[/]"
             )
-        )
-    ]
 
-    print("provider:", provider.name)
-    messages: list[ChatMessage] = [
-        ChatMessage(
-            role=MessageRole.USER,
-            content=(
-                "Uzyj narzedzia echo z argumentem text='hello from tool'. "
-                "Potem odpowiedz jednym zdaniem, co zwrocilo narzedzie."
-            ),
-        )
-    ]
-
-    # 1) Prosba o tool calls
-    request = ChatRequest(
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
-        parallel_tool_calls=False,
-    )
-    result = await provider.complete(request)
-
-    print("model:", result.model)
-    if result.tool_calls:
-        print("tool_calls:", [tc.function.name for tc in result.tool_calls])
-    if result.text:
-        print("assistant_text(pre):", result.text)
-
-    # 2) Wykonanie narzedzi + odeslanie wynikow jako role=tool
-    if result.tool_calls:
-        messages.append(
-            ChatMessage(
-                role=MessageRole.ASSISTANT,
-                content=result.text or None,
-                tool_calls=result.tool_calls,
-            )
-        )
-
-        for tc in result.tool_calls:
-            args = _safe_json_loads(tc.function.arguments)
-            if tc.function.name == "echo":
-                text = args.get("text", "")
-                tool_out = _tool_echo(text=str(text))
+        def _on_chunk(idx: int, total: int, chunk: DiffChunk, cache_hit: bool) -> None:
+            src = "cache" if cache_hit else "AI"
+            if len(chunk.file_paths) == 1:
+                files_label = chunk.file_paths[0]
+            elif len(chunk.file_paths) <= 3:
+                files_label = ", ".join(chunk.file_paths)
             else:
-                tool_out = f"Nieznane narzedzie: {tc.function.name}"
+                files_label = f"{chunk.file_paths[0]} (+{len(chunk.file_paths) - 1} innych)"
 
-            messages.append(
-                ChatMessage(
-                    role=MessageRole.TOOL,
-                    tool_call_id=tc.id,
-                    content=tool_out,
+            if chunk.is_split:
+                split_tag = (
+                    f", split {chunk.split_part}/{chunk.split_total} "
+                    f"grp={chunk.split_group}"
                 )
+            else:
+                split_tag = ""
+
+            console.print(
+                f"  [dim]\u2192 Chunk {idx}/{total}[/] "
+                f"[magenta]id={chunk.chunk_id}[/] "
+                f"[blue]{files_label}[/] "
+                f"([dim]{chunk.hunk_count} hunk(\u00f3w), {chunk.line_count}L, {src}{split_tag}[/])"
             )
 
-        # 3) Finalna odpowiedz po wynikach tooli
-        followup = await provider.complete(
-            ChatRequest(messages=messages, tools=tools, tool_choice="auto")
+        try:
+            response: AgentResponse = await agent.propose_actions(
+                chunked_commit=chunked_commit,
+                vault_changes=vault_changes,
+                vault_changed_notes=vault_changed_notes,
+                vault_knowledge=knowledge,
+                on_chunk_progress=_on_chunk,
+            )
+        except RuntimeError as exc:
+            console.print(f"[red]Blad podczas wywolywania AI: {exc}[/]")
+            if not ask_retry():
+                return False
+            continue
+
+        if not response.actions:
+            renderer.render_empty_response(response)
+            renderer.info("Zaliczam commit do processed (pusty plan = commit nic nie wnosi).")
+            agent.mark_commit_processed(state, project_sha=project_commit.sha, vault_commit_sha=None)
+            return True
+
+        plans: list[PlannedVaultWrite] = agent.plan_post_updates(response, knowledge)
+
+        renderer.render_plan(response, plans)
+
+        if not ask_confirm():
+            console.print("[yellow]Zmiany odrzucone przez usera \u2014 nic nie zapisano.[/]")
+            if ask_retry():
+                console.print("[cyan]Powtarzam generacje dla tego samego commita\u2026[/]\n")
+                continue
+            return False
+
+        console.print("[cyan]Aplikuje akcje i plany na vaulcie\u2026[/]")
+        report: ActionExecutionReport = agent.execute_plan(response, plans)
+        renderer.render_execution_report(
+            touched_files=report.touched_files,
+            failed=[f"{o.description}: {o.error_message or 'blad'}" for o in report.failed],
         )
-        print("assistant_text(final):", followup.text)
-        print("finish_reason:", followup.finish_reason)
-        print("model(final):", followup.model)
-    else:
-        print("assistant_text:", result.text)
-        print("finish_reason:", result.finish_reason)
+
+        if not report.touched_files:
+            console.print("[red]Wszystkie akcje padly \u2014 nie mam co commitowac. Przerywam ten commit.[/]")
+            if ask_retry():
+                continue
+            return False
+
+        console.print("[cyan]Commituje vault\u2026[/]")
+        try:
+            vault_sha = agent.commit_vault(
+                approved=True,
+                project_commit=chunked_commit.commit,
+                execution_report=report,
+                summary=response.summary,
+            )
+            console.print(f"[green]Zacommitowano vault: {vault_sha[:7]}[/]")
+        except RuntimeError as exc:
+            console.print(f"[red]Commit vaulta sie nie udal: {exc}[/]")
+            if ask_retry():
+                continue
+            return False
+
+        agent.mark_commit_processed(
+            state,
+            project_sha=project_commit.sha,
+            vault_commit_sha=vault_sha,
+        )
+        return True
 
 
-async def main() -> None:
+async def _run() -> int:
+    """Glowna korutyna \u2014 buduje agenta, iteruje po pending commitach.
+
+    Zwraca kod wyjscia dla ``sys.exit``:
+
+    - ``0`` \u2014 wszystko ok (rowniez "brak nowych commitow" i normalny
+      koniec przy odrzuceniu)
+    - ``1`` \u2014 blad krytyczny (niepoprawny config, brak remote, itd.)
+    """
+
     project_root = Path(__file__).resolve().parent
-    cfg = project_root / "config.yaml"
-    _run_git_reader_smoke_test(config_path=cfg, repo_path=project_root)
+    config_path = project_root / "config.yaml"
 
-    provider = build_provider(cfg)
-    await _run_tool_demo(provider)
+    if not config_path.is_file():
+        console.print(f"[red]Brak pliku konfiguracyjnego: {config_path}[/]")
+        console.print("[dim]Skopiuj config/config.example.yaml \u2192 config.yaml i uzupelnij sciezki.[/]")
+        return 1
+
+    try:
+        agent = Agent.from_config(config_path)
+    except (ValueError, RuntimeError) as exc:
+        console.print(f"[red]Blad inicjalizacji agenta: {exc}[/]")
+        return 1
+
+    console.print(f"[bold]Obsidian Git Documentation Agent[/]  \u2022 provider: {agent.provider.name}")
+    console.print(f"[dim]Project: {agent.config.project_repo_path}[/]")
+    console.print(f"[dim]Vault:   {agent.config.vault_path}[/]\n")
+
+    console.print("[cyan]Sync repozytoriow (pull + auto-stash)\u2026[/]")
+    try:
+        agent.sync_repos()
+    except Exception as exc:
+        console.print(f"[red]Sync repo nie powiodl sie: {exc}[/]")
+        return 1
+
+    state = agent.load_state()
+    renderer = PreviewRenderer(console=console)
+
+    seen_user_vault_commits: list[CommitInfo] = []
+    seen_vault_shas: set[str] = set()
+
+    processed_count = 0
+    while True:
+        commit = agent.get_next_pending_commit(state)
+        if commit is None:
+            break
+
+        user_vault_commits, _ = agent.collect_vault_changes(state)
+        for c in user_vault_commits:
+            if c.sha not in seen_vault_shas:
+                seen_vault_shas.add(c.sha)
+                seen_user_vault_commits.append(c)
+
+        proceed = await _process_single_commit(agent, state, commit, renderer)
+
+        knowledge = agent.scan_vault()
+        agent.update_vault_snapshot(state, knowledge)
+        agent.save_state(state)
+
+        if proceed:
+            processed_count += 1
+        else:
+            console.print("\n[yellow]Zatrzymano petle na prosbe usera.[/]")
+            break
+
+    if seen_user_vault_commits:
+        agent.mark_vault_user_commits_processed(state, seen_user_vault_commits)
+        agent.save_state(state)
+
+    if processed_count == 0:
+        console.print("[green]Brak nowych commitow do przetworzenia. Dokumentacja jest aktualna.[/]")
+    else:
+        console.print(f"\n[green]Koniec biegu. Przetworzono commitow w tej sesji: {processed_count}[/]")
+
+    return 0
+
+
+def main() -> None:
+    _configure_logging()
+    try:
+        exit_code = asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Przerwano przez uzytkownika (Ctrl+C). State zostal zapisany przy ostatniej iteracji.[/]")
+        exit_code = 130
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

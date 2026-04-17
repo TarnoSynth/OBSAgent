@@ -12,6 +12,13 @@ venv/
 # Logi
 logs/
 
+# Stan agenta (persystencja miedzy biegami) — lokalny per maszyna
+.agent-state.json
+.agent-state.json.*.tmp
+
+# Cache chunkow diffa i podsumowan AI (multi-turn) — lokalny, regenerowalny
+.agent-cache/
+
 # IDE
 .idea/
 *.swp

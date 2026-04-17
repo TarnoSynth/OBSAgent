@@ -7,12 +7,12 @@
 paths:
   # Ścieżka absolutna do repozytorium z kodem projektu.
   # Agent czyta stąd commity i diffy — nigdy nie modyfikuje tego repo.
-  project_repo: /home/user/projects/AthleteStack
+  project_repo: 
 
   # Ścieżka absolutna do Obsidian vault.
   # Agent tworzy i aktualizuje tutaj notatki .md.
   # Vault musi być zainicjalizowany jako repo git (plugin Obsidian Git).
-  vault: /home/user/vaults/AthleteStack-docs
+  vault: 
 
 # Który provider AI ma być używany.
 # Dopuszczalne wartości: anthropic | openai | openrouter
@@ -36,10 +36,16 @@ providers:
     base_url: https://openrouter.ai/api/v1
 
 agent:
-  # Maksymalna liczba linii diffa per plik wysyłana do AI.
-  # Diffy powyżej tego limitu zostaną obcięte — AI dostanie
-  # podsumowanie zamiast surowego diffa.
-  # Niższa wartość = mniejszy koszt API, ale mniej szczegółowa analiza.
+  # Rozmiar pojedynczego chunka diffa (w liniach) wysyłanego do AI.
+  # Diffy większe niż ten limit są dzielone na kolejne chunki per hunk
+  # (@@ ... @@) — ZADEN fragment nie jest tracony.
+  # Duże commity idą trybem multi-turn: dla każdego chunka AI zwraca
+  # krótkie podsumowanie (3-6 zdań), a finalny plan powstaje po
+  # zebraniu wszystkich podsumowań. Podsumowania są cache'owane w
+  # .agent-cache/ per (commit_sha, path, chunk_idx).
+  # Mniejszy chunk = więcej osobnych requestów (wyższy koszt API),
+  # ale każdy request tańszy w tokenach. Większy chunk = mniej
+  # requestów, ale grubszy per request.
   # Zakres: 100–1000. Domyślnie 300.
   max_diff_lines: 300
 
@@ -55,10 +61,36 @@ agent:
   # Dopuszczalne wartości: pl | en
   language: pl
 
+  # Krótka nazwa projektu używana w wiadomości commita vaulta
+  # (format: "Agent: sync z <project_name>@<short_sha>").
+  # Opcjonalne — domyślnie nazwa katalogu z paths.project_repo.
+  # project_name: AthleteStack
+
+  # Ile razy maksymalnie ponawiać wywołanie AI gdy odpowiedź nie przejdzie
+  # walidacji (np. brak tool_call `submit_plan`, niepoprawny JSON,
+  # niezgodny schemat Pydantic). Każda ponowna próba dostaje w prompcie
+  # opis poprzedniego błędu — AI ma szansę się poprawić.
+  # 0 = jedna próba bez retry. Domyślnie 2 (łącznie 3 próby).
+  max_retries: 2
+
   # Co ile sekund watcher sprawdza czy pojawiły się nowe commity.
   # Dotyczy tylko trybu: python main.py watch
   # Zakres: 10–300. Domyślnie 30.
   watch_interval: 30
+
+  # Ścieżka do pliku stanu agenta (.agent-state.json).
+  # Stan trzyma: last_run, listę przetworzonych commitów per repo
+  # oraz snapshot vaulta z końca ostatniego biegu.
+  # Domyślnie: .agent-state.json w katalogu tego config.yaml (root repo agenta).
+  # Ścieżka może być relatywna (wzgledem config.yaml) lub absolutna.
+  # state_file: .agent-state.json
+
+  # Ile ostatnich SHA commitów per repo przechowywać w stanie agenta.
+  # Starsze SHA są odrzucane przy zapisie stanu. Wpływa na rozmiar
+  # okna deduplikacji w GitReader.get_commits_since_last_run.
+  # Dla typowego użycia (1-2 commity per bieg) N=20 daje 10-20 biegów historii.
+  # Zakres: 1+. Domyślnie 20.
+  processed_commits_window: 20
 
 # Wzorce plików ignorowanych przy analizie diffów.
 # Pliki pasujące do tych wzorców nie będą wysyłane do AI.
