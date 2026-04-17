@@ -30,8 +30,16 @@ import sys
 from pathlib import Path
 
 from rich.console import Console
+from rich.panel import Panel
 
-from src.agent import Agent, AgentResponse, PreviewRenderer, ask_confirm, ask_retry
+from src.agent import (
+    Agent,
+    AgentResponse,
+    PendingBatch,
+    PreviewRenderer,
+    ask_accept_pending,
+    ask_retry,
+)
 from src.agent.action_executor import ActionExecutionReport
 from src.agent.models_chunks import ChunkedCommit, DiffChunk
 from src.agent.moc_planner import PlannedVaultWrite
@@ -48,6 +56,79 @@ def _configure_logging() -> None:
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
+    )
+
+
+def _render_pending_review_banner(batch: PendingBatch, *, vault_path: Path) -> None:
+    """Banner z instrukcja: idz do Obsidiana i przejrzyj diff-view (red + green)."""
+
+    wipe_paths = set(batch.wipe_paths)
+    create_paths = set(batch.create_paths)
+
+    lines: list[str] = []
+    lines.append(f"[bold]Vault:[/] [white]{vault_path}[/]")
+    lines.append("")
+
+    new_files = [p for p in batch.clean_by_path.keys() if p in create_paths]
+    updated_files = [p for p in batch.clean_by_path.keys() if p in wipe_paths]
+    append_files = [
+        p for p in batch.clean_by_path.keys()
+        if p not in create_paths and p not in wipe_paths
+    ]
+
+    if new_files:
+        lines.append("[bold]NOWE notatki[/] [green](tylko zielony blok \u2014 create)[/]:")
+        for p in new_files:
+            lines.append(f"  [green]\u25c9 GREEN[/] {p}")
+        lines.append("")
+
+    if updated_files:
+        lines.append(
+            "[bold]ZAKTUALIZOWANE notatki[/] [red](czerwony = poprzednie)[/] + "
+            "[green](zielony = nowe)[/]:"
+        )
+        for p in updated_files:
+            lines.append(f"  [red]\u25c9 RED[/] + [green]\u25c9 GREEN[/] {p}")
+        lines.append("")
+
+    if append_files:
+        lines.append("[bold]DOPISANE fragmenty[/] [green](zielony dopisek na koncu)[/]:")
+        for p in append_files:
+            lines.append(f"  [dim]\u25cb original[/] + [green]\u25c9 GREEN[/] {p}")
+        lines.append("")
+
+    if not batch.clean_by_path:
+        lines.append("[dim](brak akcji AI \u2014 wszystkie padly)[/]")
+        lines.append("")
+
+    if batch.plan_paths:
+        lines.append("[bold]Zaktualizowany MOC / _index.md[/] [dim](bez podswietlenia)[/]:")
+        for p in batch.plan_paths:
+            lines.append(f"  [magenta]\u25cb[/] {p}")
+        lines.append("")
+
+    lines.append(
+        "[yellow]Otworz vault w Obsidianie \u2014 czerwone bloki pokazuja TO, CO BYLO, "
+        "zielone TO, CO AGENT PROPONUJE.[/]"
+    )
+    lines.append(
+        "[yellow]NIE commituj recznie[/] \u2014 agent commituje po Twojej akceptacji."
+    )
+    lines.append("")
+    lines.append(
+        "[green]T[/] \u2192 czerwone bloki znikaja, zostaje zielona tresc jako czysty plik, "
+        "agent commituje vault."
+    )
+    lines.append(
+        "[red]n[/] \u2192 vault cofniety do stanu sprzed propozycji (czerwone wraca jako zywa tresc)."
+    )
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="[bold]Czekam na decyzje \u2014 przejrzyj diff-view w Obsidianie[/]",
+            border_style="green",
+        )
     )
 
 
@@ -138,47 +219,83 @@ async def _process_single_commit(
 
         renderer.render_plan(response, plans)
 
-        if not ask_confirm():
-            console.print("[yellow]Zmiany odrzucone przez usera \u2014 nic nie zapisano.[/]")
+        console.print(
+            "\n[cyan]Zapisuje dokumentacje do vaulta w trybie diff-view "
+            "(GREEN=nowe `[!tip]+`, RED=poprzednie `[!failure]+`)\u2026[/]"
+        )
+        report: ActionExecutionReport
+        batch: PendingBatch
+        try:
+            report, batch = agent.apply_pending(response, plans)
+        except Exception as exc:
+            console.print(f"[red]apply_pending padlo: {exc}[/]")
             if ask_retry():
-                console.print("[cyan]Powtarzam generacje dla tego samego commita\u2026[/]\n")
                 continue
             return False
 
-        console.print("[cyan]Aplikuje akcje i plany na vaulcie\u2026[/]")
-        report: ActionExecutionReport = agent.execute_plan(response, plans)
         renderer.render_execution_report(
             touched_files=report.touched_files,
             failed=[f"{o.description}: {o.error_message or 'blad'}" for o in report.failed],
         )
 
-        if not report.touched_files:
-            console.print("[red]Wszystkie akcje padly \u2014 nie mam co commitowac. Przerywam ten commit.[/]")
-            if ask_retry():
-                continue
-            return False
-
-        console.print("[cyan]Commituje vault\u2026[/]")
-        try:
-            vault_sha = agent.commit_vault(
-                approved=True,
-                project_commit=chunked_commit.commit,
-                execution_report=report,
-                summary=response.summary,
+        if not batch.has_any_write:
+            console.print(
+                "[red]Nic sie nie zapisalo \u2014 wszystkie akcje i plany padly. Nie ma co akceptowac.[/]"
             )
-            console.print(f"[green]Zacommitowano vault: {vault_sha[:7]}[/]")
-        except RuntimeError as exc:
-            console.print(f"[red]Commit vaulta sie nie udal: {exc}[/]")
+            agent.rollback_pending(batch)
             if ask_retry():
                 continue
             return False
 
-        agent.mark_commit_processed(
-            state,
-            project_sha=project_commit.sha,
-            vault_commit_sha=vault_sha,
-        )
-        return True
+        _render_pending_review_banner(batch, vault_path=agent.config.vault_path)
+
+        if ask_accept_pending():
+            console.print("[cyan]Sciagam diff-view (red+green) z vaulta\u2026[/]")
+            rewritten = agent.finalize_pending(batch)
+            if rewritten:
+                console.print(f"[green]Sciagniete highlighty z {len(rewritten)} plikow.[/]")
+
+            if not report.touched_files:
+                console.print(
+                    "[yellow]Po finalize nie ma czego commitowac \u2014 wszystkie akcje padly wczesniej.[/]"
+                )
+                if ask_retry():
+                    continue
+                return False
+
+            console.print("[cyan]Commituje vault\u2026[/]")
+            try:
+                vault_sha = agent.commit_vault(
+                    approved=True,
+                    project_commit=chunked_commit.commit,
+                    execution_report=report,
+                    summary=response.summary,
+                )
+                console.print(f"[green]Zacommitowano vault: {vault_sha[:7]}[/]")
+            except RuntimeError as exc:
+                console.print(f"[red]Commit vaulta sie nie udal: {exc}[/]")
+                console.print(
+                    "[yellow]Pliki sa juz clean na dysku, ale nie trafily do Gita. "
+                    "Mozesz zacommitowac recznie albo odrzucic i sprobowac ponownie.[/]"
+                )
+                if ask_retry():
+                    continue
+                return False
+
+            agent.mark_commit_processed(
+                state,
+                project_sha=project_commit.sha,
+                vault_commit_sha=vault_sha,
+            )
+            return True
+
+        console.print("[yellow]Odrzucam \u2014 cofam vault do stanu sprzed propozycji\u2026[/]")
+        restored = agent.rollback_pending(batch)
+        console.print(f"[green]Przywrocono {len(restored)} plikow.[/]")
+        if ask_retry():
+            console.print("[cyan]Powtarzam generacje dla tego samego commita\u2026[/]\n")
+            continue
+        return False
 
 
 async def _run() -> int:

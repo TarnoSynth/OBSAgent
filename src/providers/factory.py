@@ -68,7 +68,54 @@ def build_provider(config_path: Path | str | None = None) -> BaseProvider:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError("Brak ANTHROPIC_API_KEY — ustaw w .env lub środowisku")
-        return AnthropicProvider(api_key=api_key, default_model=str(model))
+
+        default_extra: dict[str, Any] = {}
+        effort = section.get("effort")
+        if effort is not None:
+            if not isinstance(effort, str) or effort not in {
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }:
+                raise ValueError(
+                    "config: providers.anthropic.effort musi byc jednym z: "
+                    "low, medium, high, xhigh, max"
+                )
+            default_extra["output_config"] = {"effort": effort}
+
+        thinking = section.get("thinking")
+        if thinking is not None:
+            if not isinstance(thinking, dict):
+                raise ValueError(
+                    "config: providers.anthropic.thinking musi byc mapa "
+                    "(np. {type: enabled, budget_tokens: 16000})"
+                )
+            if effort is not None:
+                raise ValueError(
+                    "config: ustaw ALBO providers.anthropic.effort ALBO thinking, "
+                    "ale nie oba naraz (effort zastepuje deprecated budget_tokens "
+                    "dla Opus 4.6+/Sonnet 4.6+, a na Opus 4.7 thinking jest juz odrzucane)"
+                )
+            default_extra["thinking"] = dict(thinking)
+
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "default_model": str(model),
+        }
+        max_tokens_raw = section.get("max_tokens")
+        if max_tokens_raw is not None:
+            try:
+                kwargs["default_max_tokens"] = int(max_tokens_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "config: providers.anthropic.max_tokens musi byc liczba calkowita"
+                ) from exc
+        if default_extra:
+            kwargs["default_extra"] = default_extra
+
+        return AnthropicProvider(**kwargs)
 
     if name == "openrouter":
         section = providers.get("openrouter")

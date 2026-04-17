@@ -33,6 +33,7 @@ from pydantic import ValidationError
 from src.agent.action_executor import ActionExecutionReport, ActionExecutor
 from src.agent.chunk_cache import ChunkCache
 from src.agent.git_context import GitContextBuilder
+from src.agent.pending import PendingBatch
 from src.agent.models import AgentState, VaultSnapshot
 from src.agent.models_actions import (
     SUBMIT_PLAN_TOOL_DESCRIPTION,
@@ -637,9 +638,49 @@ class Agent:
         response: AgentResponse,
         plans: list[PlannedVaultWrite],
     ) -> ActionExecutionReport:
-        """Aplikuje akcje + plany na vaulcie. Best-effort, zwraca raport."""
+        """Aplikuje akcje + plany na vaulcie. Best-effort, zwraca raport.
+
+        **Legacy** — zapisuje bez podswietlenia i bez snapshotu.
+        Nowy flow uzywa ``apply_pending`` + ``finalize_pending`` /
+        ``rollback_pending``. Zostawione dla testow/dry-run.
+        """
 
         return self.action_executor.execute(response.actions, plans)
+
+    def apply_pending(
+        self,
+        response: AgentResponse,
+        plans: list[PlannedVaultWrite],
+    ) -> tuple[ActionExecutionReport, PendingBatch]:
+        """Zapisuje zmiany do vaulta Z ZIELONYM PODSWIETLENIEM + snapshot.
+
+        Cienka fasada wokol ``ActionExecutor.apply_pending``. User musi
+        potem przejrzec vault w Obsidianie i wybrac:
+
+        - ``finalize_pending`` (akceptacja — usuwa zielone tlo + commit)
+        - ``rollback_pending`` (odrzucenie — restore ze snapshotu, bez commita)
+        """
+
+        return self.action_executor.apply_pending(response.actions, plans)
+
+    def finalize_pending(self, batch: PendingBatch) -> list[str]:
+        """Po akceptacji: nadpisuje pliki czysta trescia (zielone tlo znika).
+
+        Nie commituje — commit leci osobno przez ``commit_vault``.
+        Zwraca liste sciezek faktycznie rewrite-owanych (do logu).
+        """
+
+        return self.action_executor.finalize_pending(batch)
+
+    def rollback_pending(self, batch: PendingBatch) -> list[str]:
+        """Po odrzuceniu: przywraca vault do stanu ze snapshotu (akcje + plany).
+
+        Nie commituje i nie zostawia zadnych sladow — plik,
+        ktorego nie bylo przed apply, zostanie usuniety; plik ktory
+        byl — dostanie z powrotem poprzednia tresc.
+        """
+
+        return self.action_executor.rollback_pending(batch)
 
     def commit_vault(
         self,

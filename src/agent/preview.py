@@ -229,6 +229,34 @@ def ask_retry() -> bool:
     )
 
 
+def ask_accept_pending() -> bool:
+    """Po ``apply_pending`` pyta usera o decyzje podjeta-w-Obsidianie.
+
+    Agent zapisal dokumentacje do vaulta w **diff-view**:
+
+    - GREEN (callout ``[!tip]+``) = NOWA WERSJA, czeka na akceptacje
+    - RED   (callout ``[!failure]+``) = POPRZEDNIA WERSJA (dla ``update``)
+
+    User otwiera Obsidiana, porownuje czerwone i zielone bloki,
+    wraca do terminala i wybiera:
+
+    - ``T`` → ``finalize_pending`` usuwa **oba** kolory, zostaje sama nowa
+      tresc, agent commituje vault
+    - ``n`` → ``rollback_pending`` przywraca vault dokladnie do stanu
+      sprzed propozycji (bez commita)
+
+    Enter = odmowa (bezpieczny default — vault zostaje cofniety).
+    """
+
+    return ask_confirm(
+        prompt=(
+            "Akceptujesz zmiany w vaulcie? "
+            "[T = zostaje tylko GREEN (commit) | n = wszystko cofniete]"
+        ),
+        default_no=True,
+    )
+
+
 def _action_type_style(action_type: str) -> str:
     if action_type == "create":
         return "bold green"

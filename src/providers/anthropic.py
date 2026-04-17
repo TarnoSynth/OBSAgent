@@ -43,11 +43,13 @@ class AnthropicProvider(BaseProvider):
         default_max_tokens: int = 4096,
         timeout: float = 60.0,
         max_retries: int = 3,
+        default_extra: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(name="anthropic", default_model=default_model)
         self._base_url = base_url.rstrip("/")
         self._default_max_tokens = default_max_tokens
         self._max_retries = max_retries
+        self._default_extra = dict(default_extra) if default_extra else {}
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=timeout,
@@ -215,7 +217,17 @@ class AnthropicProvider(BaseProvider):
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
 
+        if self._default_extra:
+            payload.update(self._default_extra)
         payload.update(request.extra)
+
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            payload["temperature"] = 1.0
+            budget = thinking.get("budget_tokens")
+            if isinstance(budget, int) and payload["max_tokens"] <= budget:
+                payload["max_tokens"] = budget + 1024
+
         return payload
 
     async def _post_with_retries(self, payload: dict[str, Any]) -> dict[str, Any]:
