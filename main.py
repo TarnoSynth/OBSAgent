@@ -37,9 +37,10 @@ from rich.panel import Panel
 from logs import RunLogger, configure_stdlib_logging
 from src.agent import (
     Agent,
-    AgentResponse,
     PendingBatch,
     PreviewRenderer,
+    ProposedPlan,
+    SessionResult,
     ask_accept_pending,
     ask_retry,
 )
@@ -266,13 +267,14 @@ async def _process_single_commit(
             )
 
         try:
-            response: AgentResponse = await agent.propose_actions(
+            session: SessionResult = await agent.run_session(
                 chunked_commit=chunked_commit,
                 vault_changes=vault_changes,
                 vault_changed_notes=vault_changed_notes,
                 vault_knowledge=knowledge,
                 on_chunk_progress=_on_chunk,
             )
+            plan: ProposedPlan = session.plan
         except RuntimeError as exc:
             console.print(f"[red]Blad podczas wywolywania AI: {exc}[/]")
             run_logger.log(
@@ -287,16 +289,16 @@ async def _process_single_commit(
                 return False
             continue
 
-        if not response.actions:
-            renderer.render_empty_response(response)
+        if not plan.writes:
+            renderer.render_empty_response(plan)
             renderer.info("Zaliczam commit do processed (pusty plan = commit nic nie wnosi).")
             agent.mark_commit_processed(state, project_sha=project_commit.sha, vault_commit_sha=None)
             run_logger.log_commit_processed(sha=project_commit.sha, vault_sha=None)
             return True
 
-        plans: list[PlannedVaultWrite] = agent.plan_post_updates(response, knowledge)
+        plans: list[PlannedVaultWrite] = agent.plan_post_updates(plan, knowledge)
 
-        renderer.render_plan(response, plans)
+        renderer.render_plan(plan, plans)
 
         console.print(
             "\n[cyan]Zapisuje dokumentacje do vaulta w trybie diff-view "
@@ -305,7 +307,7 @@ async def _process_single_commit(
         report: ActionExecutionReport
         batch: PendingBatch
         try:
-            report, batch = agent.apply_pending(response, plans)
+            report, batch = agent.apply_pending(plan, plans)
         except Exception as exc:
             console.print(f"[red]apply_pending padlo: {exc}[/]")
             if ask_retry():
@@ -349,7 +351,7 @@ async def _process_single_commit(
                     approved=True,
                     project_commit=chunked_commit.commit,
                     execution_report=report,
-                    summary=response.summary,
+                    summary=plan.summary,
                 )
                 console.print(f"[green]Zacommitowano vault: {vault_sha[:7]}[/]")
                 run_logger.log_vault_commit(sha=vault_sha)
@@ -427,6 +429,34 @@ async def _run(run_logger: RunLogger) -> int:
         project_repo=str(agent.config.project_repo_path),
         vault=str(agent.config.vault_path),
     )
+
+    if agent.mcp_settings.enabled:
+        try:
+            await agent.start_mcp()
+        except RuntimeError as exc:
+            console.print(f"[red]MCP runtime nie wstal: {exc}[/]")
+            run_logger.log(
+                f"mcp_start_failed: {exc}",
+                level="error",
+                error_type=type(exc).__name__,
+            )
+            return 1
+        console.print(
+            f"[dim]MCP: [cyan]{agent.mcp_settings.url}[/] "
+            f"(server='{agent.mcp_settings.server_name}')[/]"
+        )
+
+    try:
+        return await _run_agent_loop(agent, run_logger)
+    finally:
+        try:
+            await agent.stop_mcp()
+        except Exception as exc:
+            logger.warning("stop_mcp podczas cleanupu padlo: %r", exc)
+
+
+async def _run_agent_loop(agent: "Agent", run_logger: RunLogger) -> int:
+    """Wewnetrzna petla po tym jak MCP wstalo - wyciagniete dla try/finally cleanupu."""
 
     console.print("[cyan]Sync repozytoriow (pull + auto-stash)\u2026[/]")
     try:
