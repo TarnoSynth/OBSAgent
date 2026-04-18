@@ -27,6 +27,9 @@ class LLMCallContext:
 
     ``attempt`` — numer proby (1-based), bo ``propose_actions`` ma retry
     walidacji. Dzieki temu w logach widac retry po walidacji Pydantic.
+
+    ``iteration`` — numer iteracji w petli tool-use (1-based; Faza 2 refaktoru).
+    W jednej ``attempt`` moze byc wiele ``iteration``, bo model iteruje tools.
     """
 
     phase: str
@@ -35,6 +38,7 @@ class LLMCallContext:
     chunk_total: int | None = None
     chunk_id: str | None = None
     attempt: int | None = None
+    iteration: int | None = None
     files: tuple[str, ...] = ()
 
 

@@ -231,6 +231,155 @@ class RunLogger:
     def log_vault_commit(self, *, sha: str) -> None:
         self._emit("vault.committed", sha=sha, sha_short=sha[:7])
 
+    # ------------------------------------------------------------------
+    # MCP lifecycle events (Faza 1 refaktoru agentic tool loop)
+    # ------------------------------------------------------------------
+
+    def log_mcp_server_started(
+        self,
+        *,
+        host: str,
+        port: int,
+        url: str,
+        server_name: str,
+        transport: str,
+    ) -> None:
+        """MCP server (FastMCP) wstartowal i przyjmuje ruch."""
+
+        self._emit(
+            "mcp.server.started",
+            host=host,
+            port=port,
+            url=url,
+            server_name=server_name,
+            transport=transport,
+        )
+
+    def log_mcp_server_stopped(self, *, host: str, port: int) -> None:
+        """MCP server zatrzymany (graceful shutdown albo cancel)."""
+
+        self._emit("mcp.server.stopped", host=host, port=port)
+
+    def log_mcp_server_crashed(self, *, error: str) -> None:
+        """MCP server padl niespodziewanie (np. port conflict pod uvicorn)."""
+
+        self._error_count += 1
+        self._emit("mcp.server.crashed", level="error", error=error)
+
+    def log_mcp_client_connected(self, *, url: str) -> None:
+        """Klient MCP polaczony z serwerem (sesja initialize zakonczona)."""
+
+        self._emit("mcp.client.connected", url=url)
+
+    def log_mcp_client_closed(self, *, url: str) -> None:
+        """Klient MCP zamknal sesje."""
+
+        self._emit("mcp.client.closed", url=url)
+
+    def log_mcp_client_list_tools(self, *, count: int, from_cache: bool) -> None:
+        """Klient pobral liste narzedzi z serwera (albo z cache)."""
+
+        self._emit(
+            "mcp.client.list_tools",
+            count=count,
+            from_cache=from_cache,
+        )
+
+    def log_mcp_call_tool_started(self, *, name: str) -> None:
+        """Klient rozpoczal wywolanie narzedzia przez MCP."""
+
+        self._emit("mcp.call_tool.started", name=name)
+
+    def log_mcp_call_tool_ok(self, *, name: str, content_len: int) -> None:
+        """Wywolanie narzedzia zwrocilo sukces (isError=False)."""
+
+        self._emit("mcp.call_tool.ok", name=name, content_len=content_len)
+
+    def log_mcp_call_tool_failed(self, *, name: str, error: str) -> None:
+        """Wywolanie narzedzia zwrocilo blad (isError=True albo exception)."""
+
+        self._error_count += 1
+        self._emit(
+            "mcp.call_tool.failed",
+            level="error",
+            name=name,
+            error=error,
+        )
+
+    # ------------------------------------------------------------------
+    # Tool-use loop events (Faza 2 refaktoru agentic tool loop)
+    # ------------------------------------------------------------------
+
+    def log_tool_loop_iteration(
+        self,
+        *,
+        sha: str,
+        iteration: int,
+        max_iterations: int,
+        tool_calls: int,
+    ) -> None:
+        """Pojedyncza iteracja petli tool-use.
+
+        ``iteration`` jest 1-based. ``tool_calls`` to liczba tool callow w tej
+        iteracji (0 oznacza ze model nie wolal narzedzia - zwykle fallback exit).
+        """
+
+        self._emit(
+            "tool.loop.iteration",
+            sha=sha,
+            sha_short=sha[:7],
+            iteration=iteration,
+            max_iterations=max_iterations,
+            tool_calls=tool_calls,
+        )
+
+    def log_tool_loop_finalized(
+        self,
+        *,
+        sha: str,
+        iterations_used: int,
+        tool_calls_total: int,
+        proposed_writes: int,
+    ) -> None:
+        """Petla zakonczona przez ``submit_plan`` (oczekiwana sciezka wyjscia)."""
+
+        self._emit(
+            "tool.loop.finalized",
+            sha=sha,
+            sha_short=sha[:7],
+            iterations_used=iterations_used,
+            tool_calls_total=tool_calls_total,
+            proposed_writes=proposed_writes,
+        )
+
+    def log_tool_loop_exhausted(
+        self,
+        *,
+        sha: str,
+        max_iterations: int,
+        tool_calls_total: int,
+        proposed_writes: int,
+        reason: str,
+    ) -> None:
+        """Petla wyszla bez ``submit_plan`` - model nie wyrobil sie albo przestal wolac narzedzia.
+
+        ``reason``: ``"max_iterations"`` albo ``"no_tool_calls"``. Obie sciezki
+        maja auto-finalizacje (agent tworzy ProposedPlan z pustym summary).
+        Event level = warning, zeby uwaga zrazila sie w konsoli.
+        """
+
+        self._error_count += 1
+        self._emit(
+            "tool.loop.exhausted",
+            level="warning",
+            sha=sha,
+            sha_short=sha[:7],
+            max_iterations=max_iterations,
+            tool_calls_total=tool_calls_total,
+            proposed_writes=proposed_writes,
+            reason=reason,
+        )
+
     def log(self, message: str, *, level: EventLevel = "info", **payload: Any) -> None:
         """Generyczny log — wszystko co nie pasuje do dedykowanego helpera."""
         self._emit("log", level=level, message=message, **payload)
