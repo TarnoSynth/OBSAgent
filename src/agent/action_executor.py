@@ -1,4 +1,4 @@
-"""Wykonuje ``AgentAction`` + plany MOC/index \u2014 best-effort, z raportem.
+"""Wykonuje ``ProposedWrite`` + plany MOC/index \u2014 best-effort, z raportem.
 
 Executor jest **glupi**: bierze liste akcji (po walidacji Pydantic
 i po akceptacji ``[T]`` uzytkownika) i sekwencyjnie je aplikuje przez
@@ -19,7 +19,7 @@ rekami (``git revert`` lub rewert pojedynczych plikow). To zgodne z
 polityka "commit gated by approval, but best-effort po commicie" \u2014
 po akceptacji user i tak dostaje jedno okno do rewertu.
 
-Kolejnosc aplikacji: najpierw wszystkie ``AgentAction`` w kolejnosci
+Kolejnosc aplikacji: najpierw wszystkie ``ProposedWrite`` w kolejnosci
 w ktorej AI je zaproponowalo (to wazne \u2014 AI moze chciec ``create`` foo
 a potem ``append`` do foo w tym samym batchu), potem wszystkie
 ``PlannedVaultWrite`` (MOC, index).
@@ -32,7 +32,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from src.agent.models_actions import AgentAction
+from src.agent.models_actions import ProposedWrite
 from src.agent.moc_planner import PlannedVaultWrite
 from src.agent.pending import (
     PendingBatch,
@@ -98,7 +98,7 @@ class ActionExecutionReport(BaseModel):
 
 
 class ActionExecutor:
-    """Aplikuje ``AgentAction`` i ``PlannedVaultWrite`` na vaulcie.
+    """Aplikuje ``ProposedWrite`` i ``PlannedVaultWrite`` na vaulcie.
 
     Wszystkie zapisy ida przez ``VaultManager`` \u2014 executor nie siega do
     dysku bezposrednio. Dzieki temu walidacja bezpieczenstwa sciezki
@@ -110,14 +110,14 @@ class ActionExecutor:
 
     def execute(
         self,
-        actions: list[AgentAction],
+        actions: list[ProposedWrite],
         plans: list[PlannedVaultWrite],
     ) -> ActionExecutionReport:
         """Wykonuje akcje + plany w ustalonej kolejnosci. Nie rzuca wyjatkow.
 
         Sekwencja:
 
-        1. Wszystkie ``AgentAction`` w kolejnosci pierwotnej.
+        1. Wszystkie ``ProposedWrite`` w kolejnosci pierwotnej.
         2. Wszystkie ``PlannedVaultWrite`` w kolejnosci pierwotnej
            (moc_planner.plan_post_action_updates sortuje juz po sciezce).
 
@@ -144,7 +144,7 @@ class ActionExecutor:
         report.touched_files = touched
         return report
 
-    def _apply_action(self, action: AgentAction) -> ActionOutcome:
+    def _apply_action(self, action: ProposedWrite) -> ActionOutcome:
         description = f"{action.type.upper()} {action.path}"
         try:
             if action.type == "create":
@@ -196,12 +196,12 @@ class ActionExecutor:
 
     def apply_pending(
         self,
-        actions: list[AgentAction],
+        actions: list[ProposedWrite],
         plans: list[PlannedVaultWrite],
     ) -> tuple[ActionExecutionReport, PendingBatch]:
         """Zapisuje zmiany do vaulta w **diff-view** (red poprzednia + green nowa) + snapshot.
 
-        Dla kazdej ``AgentAction`` plik jest zapisywany w trybie pending:
+        Dla kazdej ``ProposedWrite`` plik jest zapisywany w trybie pending:
 
         - ``create`` → ``[frontmatter_new] + GREEN(body_new)``
         - ``update`` → ``[frontmatter_new] + RED(body_previous) + GREEN(body_new)``

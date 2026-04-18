@@ -2,9 +2,9 @@
 
 **Flow (Faza 6+ refaktor):**
 
-1. Agent generuje ``AgentResponse`` + plany MOC/indeksu (bez zmian).
+1. Agent generuje ``ProposedPlan`` + plany MOC/indeksu (bez zmian).
 2. ``ActionExecutor.apply_pending`` zapisuje zmiany do vaulta, ALE:
-   - tresc kazdej ``AgentAction`` jest renderowana jako **diff-view**
+   - tresc kazdej ``ProposedWrite`` jest renderowana jako **diff-view**
      przez ``render_display_content`` — patrz tabelka nizej.
    - plany MOC/indeksu ida bez markerow (male, mechaniczne zmiany —
      highlight by je rozwalil, a user i tak ich bezposrednio nie czyta).

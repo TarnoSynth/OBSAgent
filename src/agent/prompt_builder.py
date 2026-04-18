@@ -30,6 +30,7 @@ droga.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from src.agent.models_chunks import ChunkedCommit, ChunkSummary, DiffChunk
 from src.git.models import CommitInfo
@@ -39,9 +40,20 @@ from src.vault.models import VaultKnowledge, VaultNote
 _MAX_VAULT_KNOWLEDGE_NOTES = 250
 """Gorny limit notatek w `VaultKnowledge` dopisywanych do prompta.
 
-Dla vaultow mniejszych niz limit: wszystkie pelne. Powyzej: skracamy do
-samych MOC-ow + pierwszych N po sciezce + komunikat o pominieciu. Zaklada,
-ze kazda notatka w liscie zajmuje 1-2 linie (path, type, parent)."""
+**Uwaga (Faza 4 refaktoru):** od Fazy 4 sekcja "mapa wiedzy" jest
+**mocno odchudzona** — zwraca tylko liczniki per typ + liste MOC-ow/hubow.
+Pelna lista wszystkich notatek zniknela z promptu; model pobiera szczegoly
+on-demand przez narzedzia ``list_notes`` / ``read_note`` / ``find_related``.
+
+Stala zachowana dla backward-compat i dla trybu debug (gdyby user chcial
+zrzucic pelna liste, mozemy wskrzesic starsza sciezke pod flaga)."""
+
+_MAX_HUB_LIST = 40
+"""Limit wpisow na liscie hubow (``type: hub``) w prompcie.
+
+Vault AthleteStack-style ma 10-30 hubow. Powyzej 40 lista staje sie
+nieprzydatna — agent i tak powinien szukac po filtrach, nie skanowac
+wizualnie."""
 
 
 def build_user_prompt(
@@ -53,6 +65,7 @@ def build_user_prompt(
     templates: dict[str, str],
     project_name: str,
     retry_error: str | None = None,
+    previous_actions: list[dict[str, Any]] | None = None,
 ) -> str:
     """User prompt dla trybu SMALL (caly diff mieszczacy sie w 1 chunku).
 
@@ -67,11 +80,15 @@ def build_user_prompt(
     :param templates: ``{"changelog": "...", "adr": "...", ...}``
     :param project_name: nazwa projektu (do kontekstu)
     :param retry_error: jesli retry \u2014 opis bledu walidacji poprzedniej odpowiedzi
+    :param previous_actions: jesli retry \u2014 snapshot ``ctx.executed_actions``
+        z poprzedniej proby. Renderowany jako lista "juz probowalem tego",
+        zeby model nie zaczynal od eksploracji od zera.
     """
 
     sections: list[str] = []
 
     sections.append(_section_retry_error(retry_error))
+    sections.append(_section_previous_actions(previous_actions))
     sections.append(_section_project_context(project_name))
     sections.append(_section_commit_with_chunks(chunked_commit))
     sections.append(_section_vault_changes(vault_changes, vault_changed_notes))
@@ -159,6 +176,7 @@ def build_finalize_prompt(
     templates: dict[str, str],
     project_name: str,
     retry_error: str | None = None,
+    previous_actions: list[dict[str, Any]] | None = None,
 ) -> str:
     """User prompt dla FINALIZE (tryb multi-turn, po zebraniu wszystkich podsumowan).
 
@@ -171,12 +189,13 @@ def build_finalize_prompt(
         kolejnosci co ``chunked_commit.chunks`` (1:1 mapping). Elementy
         moga pochodzic z ``ChunkCache`` lub swiezego wywolania AI.
     :param vault_changes, vault_changed_notes, vault_knowledge, templates,
-        project_name, retry_error: jak w ``build_user_prompt``.
+        project_name, retry_error, previous_actions: jak w ``build_user_prompt``.
     """
 
     sections: list[str] = []
 
     sections.append(_section_retry_error(retry_error))
+    sections.append(_section_previous_actions(previous_actions))
     sections.append(_section_project_context(project_name))
     sections.append(_section_commit_meta(chunked_commit.commit))
     sections.append(_section_file_changes_overview(chunked_commit))
@@ -195,10 +214,69 @@ def _section_retry_error(retry_error: str | None) -> str:
     return (
         "## PONOWNA PROBA \u2014 Twoja poprzednia odpowiedz byla niepoprawna\n\n"
         f"Blad walidacji: {retry_error}\n\n"
-        "Popraw odpowiedz zgodnie ze schematem narzedzia `submit_plan`. "
-        "Upewnij sie ze kazda `AgentAction.path` jest relatywna, konczy sie "
-        "na `.md` i nie wychodzi poza vault (bez `..`, bez absolutnych sciezek)."
+        "Popraw sie w tej sesji: kazda sciezka musi byc relatywna, konczyc sie "
+        "na `.md` i nie wychodzic poza vault (bez `..`, bez absolutnych sciezek). "
+        "Zakoncz **natychmiast** wywolaniem `submit_plan(summary=...)` \u2014 "
+        "ta proba jest retry, masz juz wiedze z poprzedniej rundy (ponizej). "
+        "**Nie rob ponownie eksploracji ani redundantnych write'ow**: jedynie "
+        "uzupelnij to, czego brakuje, i finalizuj."
     )
+
+
+def _section_previous_actions(
+    previous_actions: list[dict[str, Any]] | None,
+) -> str:
+    """Render listy wykonanych tool callow z poprzedniej proby (retry only).
+
+    Kontekst: ``ToolExecutionContext`` zyje per pojedyncza sesja tool-use.
+    Kiedy sesja padnie (``max_tool_iterations`` wyczerpane bez ``submit_plan``),
+    cala lista ``proposed_writes`` idzie do kosza wraz z ctx \u2014 retry zaczyna
+    od zera. Ta sekcja przekazuje modelowi **co juz probowal w poprzedniej
+    rundzie** (na podstawie ``executed_actions``), zeby nie powtarzal tej
+    samej eksploracji.
+
+    Format: krotka tabelka, max 30 pozycji (pozniejsze uciete). Kazdy wpis
+    zawiera narzedzie, sciezke (jesli byla) i wynik (ok/failed). Bez pelnych
+    args \u2014 za duzo tokenow, model i tak widzi aktualny stan vaulta.
+    """
+
+    if not previous_actions:
+        return ""
+
+    lines: list[str] = [
+        "## Poprzednia proba \u2014 co juz zrobiles (kontekst retry)",
+        "",
+        "Ponizej lista tool callow z **poprzedniej proby** tej sesji. Sesja "
+        "zostala przerwana (np. brak `submit_plan` w budzecie iteracji), wiec "
+        "ctx zostal zresetowany \u2014 ale logicznie te akcje byly juz proponowane. "
+        "Traktuj to jak swoja pamiec: **nie powtarzaj eksploracji** (`list_notes`, "
+        "`read_note`, `find_related`) i **nie duplikuj write'ow** o tej samej "
+        "semantyce. Idz prosto do uzupelnienia brakujacych rzeczy i `submit_plan`.",
+        "",
+        "| # | Narzedzie | Sciezka | Wynik |",
+        "|---|-----------|---------|-------|",
+    ]
+
+    max_rows = 30
+    for idx, action in enumerate(previous_actions[:max_rows], start=1):
+        tool_name = str(action.get("tool") or "?")
+        path = str(action.get("path") or "-")
+        result = str(action.get("result") or "?")
+        lines.append(f"| {idx} | `{tool_name}` | `{path}` | {result} |")
+
+    overflow = len(previous_actions) - max_rows
+    if overflow > 0:
+        lines.append("")
+        lines.append(f"_... i jeszcze {overflow} akcji (ucieto dla oszczednosci tokenow)._")
+
+    lines.append("")
+    lines.append(
+        "> **Stan vaulta powyzej odzwierciedla swiezy skan** \u2014 jesli w tabeli "
+        "widzisz `create_*` na sciezce, ktora w `list_notes` jeszcze nie istnieje, "
+        "oznacza to, ze ta akcja nie zostala zaaplikowana (ctx zresetowany). "
+        "Powtorz ja w tej probie, bo bez tego commit nie zostanie udokumentowany."
+    )
+    return "\n".join(lines)
 
 
 def _section_project_context(project_name: str) -> str:
@@ -407,46 +485,79 @@ def _format_note_block(note: VaultNote) -> str:
 
 
 def _section_vault_knowledge(knowledge: VaultKnowledge) -> str:
+    """Mapa wiedzy — **tylko top-level** (Faza 4 refaktoru).
+
+    Do Fazy 3 sekcja dumpowala pelna liste notatek (path | type | parent)
+    do 250 wpisow. Od Fazy 4 zostaje tylko **skompresowana mapa**:
+
+    - liczniki per type (``hub: 12, decision: 38, module: 15, ...``)
+    - liczniki meta (total_notes, all_tags, orphaned_links)
+    - lista MOC-ow (z iloscia dzieci)
+    - lista hubow (max ``_MAX_HUB_LIST``)
+
+    Pozostale informacje (konkretne notatki, backlinki, tresc) agent
+    pobiera **on-demand** przez narzedzia eksploracyjne:
+    ``list_notes`` / ``read_note`` / ``find_related`` / ``list_pending_concepts``.
+
+    Dzieki temu prompt jest staly w rozmiarze niezaleznie od rozmiaru
+    vaulta (rosnie tylko logarytmicznie przez liczniki) — a prompt caching
+    lapie gesty, powtarzalny prefiks.
+    """
+
     lines: list[str] = [
-        "## Aktualny stan vaulta \u2014 mapa wiedzy",
+        "## Aktualny stan vaulta \u2014 mapa wiedzy (top-level)",
         "",
         f"- **Lacznie notatek:** {knowledge.total_notes}",
         f"- **MOC-ow:** {len(knowledge.moc_files)}",
         f"- **Unikalne tagi:** {len(knowledge.all_tags)}",
         f"- **Osierocone wikilinki:** {len(knowledge.orphaned_links)}",
         "",
+        "> Szczegoly (konkretne notatki, tresci, backlinki) pobieraj **on-demand** "
+        "przez narzedzia: `list_notes`, `read_note`, `find_related`, "
+        "`list_pending_concepts`. Ta sekcja to TYLKO mapa najwyzszego poziomu.",
+        "",
     ]
+
+    if knowledge.by_type:
+        counts = sorted(
+            ((t, len(paths)) for t, paths in knowledge.by_type.items()),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+        counts_str = ", ".join(f"`{t}`: {n}" for t, n in counts)
+        lines.append(f"- **Notatki per type:** {counts_str}")
+        lines.append("")
 
     mocs = knowledge.mocs()
     if mocs:
         lines.append("### MOC-i (uzyj ich w `parent` nowych notatek)")
         for moc in mocs:
             children_count = len(knowledge.children_of(Path(moc.path).stem))
-            lines.append(f"- `[[{Path(moc.path).stem}]]` ({moc.path}) \u2014 {children_count} dzieci")
+            lines.append(
+                f"- `[[{Path(moc.path).stem}]]` ({moc.path}) \u2014 {children_count} dzieci"
+            )
         lines.append("")
 
-    lines.append("### Lista notatek (path | type | parent)")
-    lines.append("")
-
-    notes_sorted = sorted(knowledge.notes, key=lambda n: n.path)
-    limit_exceeded = len(notes_sorted) > _MAX_VAULT_KNOWLEDGE_NOTES
-    subset = notes_sorted[:_MAX_VAULT_KNOWLEDGE_NOTES] if limit_exceeded else notes_sorted
-
-    for n in subset:
-        parent_str = f"[[{n.parent}]]" if n.parent else "-"
-        type_str = n.type or "-"
-        lines.append(f"- `{n.path}` | {type_str} | {parent_str}")
-
-    if limit_exceeded:
-        skipped = len(notes_sorted) - _MAX_VAULT_KNOWLEDGE_NOTES
-        lines.append(f"- _... i jeszcze {skipped} notatek \u2014 pominieto dla oszczednosci tokenow_")
+    hubs = knowledge.find_by_type("hub")
+    if hubs:
+        hubs_sorted = sorted(hubs, key=lambda n: n.path)
+        limit_exceeded = len(hubs_sorted) > _MAX_HUB_LIST
+        subset = hubs_sorted[:_MAX_HUB_LIST]
+        lines.append("### Huby (`type: hub`) \u2014 wezly tematyczne")
+        for hub in subset:
+            parent_str = f" \u2190 [[{hub.parent}]]" if hub.parent else ""
+            lines.append(f"- `[[{Path(hub.path).stem}]]` ({hub.path}){parent_str}")
+        if limit_exceeded:
+            skipped = len(hubs_sorted) - _MAX_HUB_LIST
+            lines.append(
+                f"- _... i jeszcze {skipped} hubow \u2014 uzyj `list_notes(type='hub')`._"
+            )
+        lines.append("")
 
     if knowledge.orphaned_links:
-        lines.append("")
-        lines.append("### Osierocone wikilinki (brak odpowiadajacych plikow)")
-        preview = ", ".join(knowledge.orphaned_links[:30])
-        if len(knowledge.orphaned_links) > 30:
-            preview += f" ... (+{len(knowledge.orphaned_links) - 30})"
+        lines.append("### Osierocone wikilinki (placeholdery \u2014 kandydaci do wypelnienia)")
+        preview = ", ".join(knowledge.orphaned_links[:20])
+        if len(knowledge.orphaned_links) > 20:
+            preview += f" ... (+{len(knowledge.orphaned_links) - 20} \u2014 uzyj `list_pending_concepts`)"
         lines.append(preview)
 
     return "\n".join(lines)
@@ -482,14 +593,14 @@ def _section_task_small() -> str:
     return (
         "## Zadanie\n\n"
         "Przeanalizuj powyzszy commit projektowy w kontekscie stanu vaulta i "
-        "zmian recznych. Zaproponuj liste ``AgentAction`` \u2014 operacji "
-        "(create / update / append) na plikach .md w vaulcie \u2014 tak, "
-        "zeby dokumentacja po tym biegu odzwierciedlala stan kodu z "
-        "tego commita. Pusta lista akcji jest dozwolona gdy commit nic "
-        "semantycznie nie wnosi.\n\n"
-        "Wywolaj DOKLADNIE RAZ narzedzie `submit_plan` z argumentami "
-        "zgodnymi z jego schematem. Nie pisz zadnej odpowiedzi tekstowej "
-        "obok tool callu."
+        "zmian recznych. Pracujesz w **petli tool-use** \u2014 wywoluj kolejno "
+        "narzedzia `create_note` / `update_note` / `append_to_note`, aby "
+        "zarejestrowac kazda propozycje zmiany w vaulcie (nic nie jest "
+        "zapisywane natychmiast \u2014 zmiany trafiaja do bufora propozycji).\n\n"
+        "Sesje ZAWSZE konczysz wywolaniem `submit_plan(summary=\"...\")`, "
+        "nawet jesli nie zarejestrowales zadnej akcji (pusty plan jest "
+        "dozwolony gdy commit nic nie wnosi dokumentacyjnie \u2014 "
+        "w `summary` wyjasnij dlaczego)."
     )
 
 
@@ -498,9 +609,10 @@ def _section_task_finalize() -> str:
         "## Zadanie (FINALIZE)\n\n"
         "Masz juz powyzej **zebrane podsumowania WSZYSTKICH chunkow** tego commita. "
         "Na ich podstawie, wraz z aktualnym stanem vaulta i recznymi zmianami "
-        "usera, zaproponuj plan dokumentacji.\n\n"
-        "Wywolaj DOKLADNIE RAZ narzedzie `submit_plan` z argumentami "
-        "zgodnymi z jego schematem. Nie pisz zadnej odpowiedzi tekstowej "
-        "obok tool callu. Pusta lista ``actions`` jest dozwolona gdy commit "
-        "nic semantycznie nie wnosi do dokumentacji."
+        "usera, zaproponuj plan dokumentacji wywolujac kolejno narzedzia "
+        "`create_note` / `update_note` / `append_to_note`.\n\n"
+        "Sesje ZAWSZE konczysz wywolaniem `submit_plan(summary=\"...\")`, "
+        "nawet jesli nie zarejestrowales zadnej akcji \u2014 pusta propozycja "
+        "jest dozwolona, gdy commit nic nie wnosi do dokumentacji "
+        "(w `summary` wyjasnij dlaczego)."
     )

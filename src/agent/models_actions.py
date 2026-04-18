@@ -1,51 +1,58 @@
-"""Modele `AgentAction` / `AgentResponse` + schema dla tool callingu.
+"""Modele ``ProposedWrite`` / ``ProposedPlan`` / ``SessionResult`` (Faza 7).
 
-Zgodnie z decyzja projektowa dla Fazy 6, AI zwraca plan dzialan
-**wylacznie** przez tool calling \u2014 narzedzie `submit_plan` wymusza
-schemat odpowiedzi po stronie providera. My dostajemy gotowy JSON
-w `tool_calls[0].function.arguments`, parsujemy go przez Pydantic
-i dostajemy twardy kontrakt.
+**Historycznie (Fazy 0-6):** AI zwracalo pojedynczy ``submit_plan(actions=[...])``
+z calym planem w jednym JSON-ie. Modele nazywaly sie ``AgentAction`` i
+``AgentResponse``, a generator ``build_submit_plan_schema`` eksponowal ten
+schemat jako ``tools=[submit_plan]`` w ``ChatRequest``.
 
-Modele tej warstwy:
+**Po Fazie 7:** AI dziala w pelnej petli tool-use — rejestruje operacje
+rozproszonymi tool callami (``create_note`` / ``update_note`` / ``append_section``
+/ ...), a ``submit_plan`` jest wylacznie sygnalem zakonczenia sesji
+(argument: ``summary``). Struktury zostaly przemianowane, zeby nazwy
+odzwierciedlaly nowa semantyke:
 
-- ``AgentAction``   \u2014 jedna operacja na vaulcie (create / update / append)
-- ``AgentResponse`` \u2014 lista akcji + summary (wszystko, co AI proponuje w biegu)
+- ``ProposedWrite``  — jedna operacja zapisu zaproponowana przez tool call
+  (dawniej ``AgentAction``). Zyje w ``ToolExecutionContext.proposed_writes``.
+- ``ProposedPlan``   — suma propozycji z calej sesji + ``summary`` (dawniej
+  ``AgentResponse``). Budowany przez agenta po wyjsciu z petli, konsumowany
+  przez ``apply_pending`` / ``finalize_pending`` / preview.
+- ``SessionResult``  — ``ProposedPlan`` + metryki sesji (iterations_used,
+  tool_calls_count, finalized_by_submit_plan).
 
-Walidacja Pydantic jest **pierwsza linia obrony**: scie\u017cki musz\u0105 byc
-relatywne, bez ``..`` i bez wyjscia poza vault. Typy ograniczone do
-literalnych wartosci. Dzieki temu preview pokazuje userowi tylko
-propozycje, ktore przeszly schemat \u2014 bez halasu.
-
-Druga linia obrony (`note_exists` vs typ akcji) siedzi w executorze
-w trakcie wykonania, nie w samym modelu \u2014 Pydantic nie wie o stanie
-vaulta.
+Walidacja Pydantic dla ``ProposedWrite.path`` jest **pierwsza linia obrony**
+— zduplikowana w ``VaultManager._resolve_safe_path`` dla pewnosci. Walidator
+content dopuszcza pusty string tylko dla append; dla create/update wymaga
+niepustej tresci (bo to cala notatka z frontmatterem).
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 ActionType = Literal["create", "update", "append"]
 
 
-class AgentAction(BaseModel):
-    """Pojedyncza akcja proponowana przez AI do wykonania na vaulcie.
+class ProposedWrite(BaseModel):
+    """Pojedyncza propozycja zapisu zbierana w trakcie sesji tool-use.
 
-    Kontrakty:
+    Reprezentuje efekt pojedynczego tool calla (np. ``create_note``,
+    ``update_note``, ``append_section``) jako atomowy patch na vaulcie.
+    Zbierane w ``ToolExecutionContext.proposed_writes`` przez warstwe
+    ``src/agent/tools/vault_write/_common.py`` — zadne narzedzie nie pisze
+    do dysku przed ``apply_pending``.
 
-    - ``type`` musi byc jednym z: ``create`` / ``update`` / ``append``
-    - ``path`` jest **relatywny wzgledem vaulta**, zawsze ``.md``, bez
-      ``..``, bez absolutnej sciezki, bez driveow
+    Kontrakty pol:
+
+    - ``type``: ``create`` / ``update`` / ``append``
+    - ``path``: **relatywny** wzgledem vaulta, zawsze ``.md``, bez ``..``,
+      bez drive-letter (Windows), bez wiodacego ``/``
     - ``content``:
-        - dla ``create`` i ``update`` \u2014 **pelna** tresc z frontmatterem
-        - dla ``append`` \u2014 sam dopisek do body (bez frontmattera)
-
-    Walidacja scieznowa jest **duplikowana** w ``VaultManager._resolve_safe_path``
-    \u2014 tamta jest ostatnia twarda linia, ta tutaj odsiewa wiekszosc
-    prob zanim dojda do executora.
+        - dla ``create`` i ``update`` — **cala** tresc pliku (wraz z
+          frontmatterem YAML)
+        - dla ``append`` — sam dopisek do body (bez frontmattera)
     """
 
     type: ActionType
@@ -88,17 +95,23 @@ class AgentAction(BaseModel):
         return value
 
 
-class AgentResponse(BaseModel):
-    """Pelna odpowiedz AI dla jednej iteracji (jeden commit projektowy).
+class ProposedPlan(BaseModel):
+    """Zbiorczy plan zapisow + ``summary`` po zakonczonej sesji tool-use.
 
-    ``actions`` moze byc **pusta lista** \u2014 to sygnal od AI "ten commit
-    nic semantycznie nie wnosi, nie ma co dokumentowac" (np. `bump deps`,
-    `fix typo`). Agent wtedy pominie ten commit (ale go zaliczy do
-    ``processed_commits`` \u2014 decyzja po stronie agenta, nie AI).
+    Budowany przez ``Agent._build_proposed_plan`` z ``ctx.proposed_writes``
+    + ``ctx.final_summary`` po wywolaniu ``submit_plan``. Konsumowany przez:
+
+    - ``plan_post_updates`` — pre-compute planow MOC/_index (safety net po Fazie 7).
+    - ``apply_pending``     — zapisuje diff-view do vaulta.
+    - ``PreviewRenderer``   — rich tabela w terminalu.
+
+    ``writes`` moze byc pusta lista — commit projektowy ktory nic nie wnosi
+    semantycznie (np. bump deps, fix typo). Agent i tak zaliczy go do
+    ``processed_commits`` z odpowiednia adnotacja w preview.
     """
 
-    summary: str = Field(..., description="1-2 zdania: co zrobil AI w tej iteracji i dlaczego.")
-    actions: list[AgentAction] = Field(default_factory=list)
+    summary: str = Field(..., description="1-2 zdania: co zrobil AI w tej sesji i dlaczego.")
+    writes: list[ProposedWrite] = Field(default_factory=list)
 
     @field_validator("summary")
     @classmethod
@@ -111,54 +124,53 @@ class AgentResponse(BaseModel):
         return stripped
 
 
-SUBMIT_PLAN_TOOL_NAME = "submit_plan"
+class SessionResult(BaseModel):
+    """Wynik pojedynczej sesji ``Agent.run_session`` (Faza 2 refaktoru, Faza 7 rename).
 
-SUBMIT_PLAN_TOOL_DESCRIPTION = (
-    "Zwroc plan dzialan na vaulcie dla analizowanego commita projektowego. "
-    "Wywolaj to narzedzie DOKLADNIE RAZ. Pusta lista `actions` jest dozwolona "
-    "\u2014 wtedy w `summary` wyjasnij dlaczego commit nie wymaga dokumentacji."
-)
+    **Semantyka:**
 
+    Sesja = jeden commit projektowy przechodzi przez petle tool-use
+    (``create_note`` / ``update_note`` / ``append_to_note`` / ... + narzedzia
+    eksploracyjne + domain creators + ``submit_plan`` terminator). Po wyjsciu
+    z petli agent zwraca ``SessionResult``, ktory niesie *wszystkie*
+    informacje potrzebne na zewnatrz:
 
-def build_submit_plan_schema() -> dict[str, Any]:
-    """Buduje JSON schema parametrow narzedzia `submit_plan`.
-
-    Generowany z modelu Pydantic ``AgentResponse`` \u2014 jedno zrodlo prawdy.
-    Wynik jest kompatybilny z OpenAI/OpenRouter tools i Anthropic
-    input_schema (oba akceptuja ten sam kompaktowy JSON Schema).
-
-    Gdy schemat Pydantica bedzie sie zmienial, ten generator automatycznie
-    za nim podaza \u2014 nie ma podwojnego utrzymania.
+    - ``plan`` — ``ProposedPlan`` (summary + writes) zbudowany
+      z ``ctx.final_summary`` + ``ctx.proposed_writes``. Konsumowany przez
+      ``apply_pending`` / ``finalize_pending`` / preview.
+    - ``iterations_used`` — ile iteracji petli wykonal model (dla logow
+      i heurystyk "czy trzeba podnosic max_tool_iterations").
+    - ``tool_calls_count`` — ile tool callow model wywolal lacznie (liczy
+      sie KAZDE wywolanie, rowniez te ktore padly walidacja).
+    - ``finalized_by_submit_plan`` — ``True`` gdy model zakonczyl przez
+      ``submit_plan`` (oczekiwana sciezka). Po Fazie 7 zawsze ``True`` — petla
+      bez submit_plan rzuca ``_SessionValidationError`` i retry; fallback
+      exit z pustym summary zostal usuniety.
     """
 
-    schema = AgentResponse.model_json_schema()
+    model_config = ConfigDict(extra="forbid")
 
-    return _inline_definitions(schema)
+    plan: ProposedPlan
+    iterations_used: int = Field(..., ge=0)
+    tool_calls_count: int = Field(..., ge=0)
+    finalized_by_submit_plan: bool
+
+    @property
+    def summary(self) -> str:
+        """Skrot do ``plan.summary`` — czesty helper w main.py / preview."""
+
+        return self.plan.summary
+
+    @property
+    def writes(self) -> list[ProposedWrite]:
+        """Skrot do ``plan.writes`` — czesty helper w apply_pending i testach."""
+
+        return self.plan.writes
 
 
-def _inline_definitions(schema: dict[str, Any]) -> dict[str, Any]:
-    """Rozwija ``$defs`` z top-levelu schematu do inline subschematow.
-
-    Providerzy (szczegolnie Anthropic) nie zawsze radza sobie z ``$ref``
-    i ``$defs`` \u2014 bezpieczniej spelnic caly schemat od reki w jednym
-    miejscu. Funkcja jest minimalna: zaklada, ze ``$defs`` i odwolania
-    ``$ref`` wystepuja tylko raz i niezagnieezdzone (co jest prawda dla
-    ``AgentResponse``).
-    """
-
-    defs = schema.pop("$defs", None) or schema.pop("definitions", None) or {}
-
-    def _resolve(node: Any) -> Any:
-        if isinstance(node, dict):
-            if "$ref" in node and isinstance(node["$ref"], str):
-                ref = node["$ref"]
-                if ref.startswith("#/$defs/") or ref.startswith("#/definitions/"):
-                    key = ref.split("/")[-1]
-                    if key in defs:
-                        return _resolve(defs[key])
-            return {k: _resolve(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [_resolve(item) for item in node]
-        return node
-
-    return _resolve(schema)
+__all__ = [
+    "ActionType",
+    "ProposedPlan",
+    "ProposedWrite",
+    "SessionResult",
+]

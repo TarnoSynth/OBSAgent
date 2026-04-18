@@ -1,32 +1,37 @@
-"""Pre-compute co ``MOCManager.ensure_note_in_moc`` i ``update_index`` zrobia.
+"""Safety-net pre-compute dla MOC i ``_index.md`` (Faza 7 cleanup).
 
-Agent **nigdy** nie commituje bez zgody usera. Preview musi pokazac
-userowi **pelny** zestaw zmian, ktory znajdzie sie w commicie na vault
-\u2014 nie tylko ``AgentAction`` od AI, ale takze efekty auto-utrzymania
-MOC i indeksu. Inaczej user widzi polowe prawdy.
+**Rola po Fazie 7:**
 
-Ta warstwa wykonuje **suchy plan** (dry-run): na podstawie aktualnego
-``VaultKnowledge`` i listy ``AgentAction`` generuje ``PlannedVaultWrite``
-\u2014 konkretne operacje na plikach MOC i ``_index.md``. Nic nie zapisuje.
+Glowna logika dopisywania linkow do MOC oraz utrzymania ``_index.md``
+siedzi teraz w **narzedziach** (``add_moc_link``, ``create_hub``,
+``create_*`` domain creators) — agent sam deklaruje te zmiany przez
+tool cally. Ten modul **nie duplikuje** juz tej roli. Zostaje jako
+**safety net** dla edge-case'ow:
 
-Executor (``action_executor.py``) dostaje ten plan razem z lista akcji
-i aplikuje caloscii w odpowiedniej kolejnosci po akceptacji ``[T]``:
+- notatka ``create`` bez ``parent`` we frontmatterze i bez rownoczesnego
+  tool calla ``add_moc_link`` (np. model zapomnial) — wtedy wyprowadzamy
+  brakujacy wpis z heurystyki (``MOCManager.find_moc_for_note``);
+- ``_index.md`` auto-indeks typow — zostaje zaktualizowany wylacznie dla
+  ``create`` nowych notatek, bez ktorych model i tak nie dostaje go
+  w ``list_notes`` (usability compromise).
 
-1. AgentAction (create/update/append)
-2. PlannedVaultWrite dla MOC
-3. PlannedVaultWrite dla ``_index.md``
-4. Jeden commit Gitowy na vault
+**Co NIE jest robione po Fazie 7:**
 
-Dla akcji ``append`` **nie** aktualizujemy MOC (zalozenie: notatka juz
-istniala, wiec juz jest w MOC lub celowo nie jest). Aktualizujemy
-``_index.md`` tylko dla ``create`` \u2014 update/append nie zmienia obecnosci
-wpisu w indeksie.
+- Dopisywanie MOC linkow dla akcji ``update`` / ``append`` — model
+  decyduje samodzielnie przez tool cally (ikoniczna pozycja: user moze
+  update'owac hub bez linku w MOC-u, co jest legalna operacja).
+- Linkowanie juz zlinkowanych notatek (idempotencja sprawdzana przez
+  ``_moc_contains_link``).
 
-Algorytm dla wielu akcji tworzacych notatki w tym samym MOC / indeksie:
-idziemy po akcjach kolejno i aktualizujemy **zywa kopie** tresci MOC /
-index w pamieci. Na koncu emitujemy jeden ``PlannedVaultWrite`` per plik
-(jesli byly zmiany). Dzieki temu nie trzeba doklejac
-``append-over-append`` w executorze.
+Preview dalej musi zobaczyc **pelny** zestaw zmian — wlacznie z tymi,
+ktore doklada ta warstwa — zeby user widzial calosc commita przed
+``[T/n]``. Dlatego emitujemy ``PlannedVaultWrite`` a nie zapisujemy
+od razu.
+
+Algorytm dla wielu akcji: iterujemy po akcjach kolejno i aktualizujemy
+**zywa kopie** tresci MOC / index w pamieci. Na koncu emitujemy jeden
+``PlannedVaultWrite`` per plik (jesli byly zmiany). Dzieki temu nie
+trzeba doklejac ``append-over-append`` w executorze.
 """
 
 from __future__ import annotations
@@ -38,7 +43,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field
 
-from src.agent.models_actions import AgentAction
+from src.agent.models_actions import ProposedWrite
+from src.agent.tools.vault_write.register_pending_concept import PENDING_CONCEPTS_PATH
 from src.vault.manager import VaultManager
 from src.vault.models import VaultKnowledge, VaultNote
 from src.vault.moc import DEFAULT_INDEX_PATH, MOCManager
@@ -77,24 +83,33 @@ _WIKILINK_TARGET_RE = re.compile(r"^\[\[([^\]]+)\]\]$")
 
 
 def plan_post_action_updates(
-    actions: list[AgentAction],
+    actions: list[ProposedWrite],
     vault_manager: VaultManager,
     knowledge: VaultKnowledge,
     *,
     index_path: str = DEFAULT_INDEX_PATH,
 ) -> list[PlannedVaultWrite]:
-    """Generuje plan aktualizacji MOC i indeksu dla listy ``AgentAction``.
+    """Safety-net: dokleja brakujace MOC / index wpisy dla ``ProposedWrite``.
+
+    Po Fazie 7 glowna logika dopinania MOC linkow i indeksu siedzi w
+    tool'ach (``add_moc_link``, ``create_hub``, domain creators). Ta
+    funkcja dziala **tylko jako siec bezpieczenstwa**: jesli model
+    stworzyl notatke ``type: hub/concept/...`` bez ``parent`` we
+    frontmatterze **i** bez osobnego ``add_moc_link`` w tej samej sesji
+    — wtedy wyprowadzamy brakujacy wpis z heurystyki (``MOCManager.
+    find_moc_for_note``).
 
     Algorytm:
 
     1. Pobierz obecne tresci plikow MOC kandydatow + indeksu (w pamieci).
-    2. Dla kazdej akcji (create/update) wywnioskuj ``VaultNote`` i wyznacz
-       pasujacy MOC. Jesli jest i nie linkuje jeszcze do notatki \u2014
-       dopisz ``- [[stem]]`` do zywej kopii.
-    3. Dla kazdej akcji typu ``create`` dopisz wpis do indeksu (sekcja
-       wedlug typu). Jesli indeks nie istnieje \u2014 zaczynamy od szablonu.
-    4. Na koncu emitujemy po jednym ``PlannedVaultWrite`` per plik, dla
-       ktorych finalna tresc roznie sie od poczatkowej.
+    2. Wyznacz zestaw MOC'ow juz dopisanych przez model (path'y MOC-owych
+       ``ProposedWrite``) — tych nie ruszamy (model sam zadbal).
+    3. Dla notatek ``create``/``update`` bez ``parent`` w FM dopisz
+       ``- [[stem]]`` do sugerowanego MOC jesli tamten jeszcze nie linkuje.
+    4. Dla ``create`` auto-aktualizuj ``_index.md`` (usability: bez tego
+       model nie widzi nowosci w ``list_notes`` z filtra typu).
+    5. Emit po jednym ``PlannedVaultWrite`` per plik, ktorego tresc sie
+       zmienila.
 
     Zwraca: plany MOC (posortowane po sciezce) + plany index (max 1).
     """
@@ -108,17 +123,43 @@ def plan_post_action_updates(
     index_created_now = False
     index_preview_lines: list[str] = []
 
+    # Faza 7 safety-net: MOC pliki, ktore model sam zaktualizowal w tej
+    # sesji (np. przez ``add_moc_link`` lub ``create_hub`` z parent_moc).
+    # Dla nich NIE dokladamy nic post-hoc — zakladamy, ze model zadbal
+    # o zlinkowanie wszystkich swoich notatek swiadomie.
+    tool_touched_mocs = {
+        action.path for action in actions
+        if _looks_like_moc_path(action.path)
+    }
+
     for action in actions:
         if action.type not in ("create", "update", "append"):
+            continue
+
+        # Faza 6: ``_Pending_Concepts.md`` to notatka-sluga (indeks placeholderow),
+        # nie wezel merytoryczny — nie dopisujemy jej do zadnego MOC ani do
+        # ``_index.md``. Register_pending_concept tworzy/aktualizuje ten plik
+        # przez granularny write, ale auto-utrzymanie grafu go ignoruje.
+        if action.path == PENDING_CONCEPTS_PATH:
             continue
 
         note = _infer_note_from_action(action, vault_manager)
         if note is None:
             continue
 
-        if action.type in ("create", "update") and not _is_moc_note(note):
+        # Notatki z ``type: index`` (np. sam ``_index.md``, auto-indeksy)
+        # tez nie powinny trafiac do MOC/auto-index, identyczna logika jak dla
+        # type: moc. Zostawiamy je w spokoju.
+        if (note.type or "").lower() == "index":
+            continue
+
+        # Faza 7: safety-net jest aktywny TYLKO dla notatek ``create``, ktore
+        # nie maja ``parent`` we frontmatterze. Jesli model ustawil parent
+        # albo notatka jest tylko aktualizowana — respektujemy jego decyzje
+        # (model wie lepiej, narzedzia mial i z nich skorzystal).
+        if action.type == "create" and not note.parent and not _is_moc_note(note):
             moc = moc_manager.find_moc_for_note(note, knowledge=knowledge)
-            if moc is not None:
+            if moc is not None and moc.path not in tool_touched_mocs:
                 moc_path = moc.path
                 draft = moc_state.get(moc_path)
                 if draft is None:
@@ -131,7 +172,10 @@ def plan_post_action_updates(
                     moc_preview.setdefault(moc_path, []).append(f"- [[{stem}]]")
 
         if action.type == "create":
-            section = MOCManager._section_title_for(note)  # type: ignore[attr-defined]
+            # _section_title_for stalo sie instance method po parametryzacji
+            # moc_pattern (Faza 0 refaktoru tool loop) \u2014 wolamy przez instancje
+            # zeby korzystac z pattern-aware rozpoznawania MOC-ow.
+            section = moc_manager._section_title_for(note)
             entry = f"- [[{Path(note.path).stem}]]"
 
             if index_draft is None:
@@ -205,9 +249,9 @@ class _FileDraft:
 
 
 def _infer_note_from_action(
-    action: AgentAction, vault_manager: VaultManager
+    action: ProposedWrite, vault_manager: VaultManager
 ) -> VaultNote | None:
-    """Buduje ``VaultNote`` na podstawie ``AgentAction.content`` + ``path``.
+    """Buduje ``VaultNote`` na podstawie ``ProposedWrite.content`` + ``path``.
 
     - ``create`` / ``update`` \u2014 parsuje frontmatter z ``content``
     - ``append`` \u2014 jesli notatka juz istnieje, czyta z dysku (pomijamy
@@ -285,6 +329,18 @@ def _is_moc_note(note: VaultNote) -> bool:
     if (note.type or "").lower() == "moc":
         return True
     return Path(note.path).stem.startswith("MOC__")
+
+
+def _looks_like_moc_path(path: str) -> bool:
+    """Czy sciezka wyglada na plik MOC (heurystyka po stem).
+
+    Uzywane do decyzji "model juz zadbal o ten MOC" w safety-netie
+    Fazy 7 — jesli ``ProposedWrite.path`` to plik MOC, nie doklejamy
+    nic post-hoc do tego samego pliku.
+    """
+
+    stem = Path(path).stem
+    return stem.startswith("MOC__")
 
 
 def _moc_contains_link(content: str, stem: str) -> bool:

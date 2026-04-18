@@ -8,7 +8,7 @@ User musi zobaczyc **cale** zmiany, ktore znajda sie w commicie na vault:
 
 Kazda pozycja wysiwetlana w tabeli Rich z trzema kolumnami: typ, sciezka,
 opis (pierwsze N linii nowej tresci lub podsumowanie). Pod tabela
-``AgentResponse.summary`` od AI \u2014 krotki opis dlaczego AI wybralo te akcje.
+``ProposedPlan.summary`` od AI \u2014 krotki opis dlaczego AI wybralo te akcje.
 
 Na koncu prompt ``[T/n]`` + obsluga odpowiedzi. Funkcja ``ask_confirm``
 blokujaco czyta stdin \u2014 zwraca bool. User nacisnie Enter bez tekstu =
@@ -26,8 +26,19 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from src.agent.models_actions import AgentAction, AgentResponse
+from src.agent.models_actions import ProposedPlan, ProposedWrite
 from src.agent.moc_planner import PlannedVaultWrite
+from src.agent.tools.vault_write.register_pending_concept import (
+    PENDING_CONCEPTS_PATH,
+    PENDING_CONCEPTS_SECTION,
+)
+from src.agent.tools.vault_write._markdown_ops import (
+    _iter_code_fence_mask,
+    _parse_pipe_row,
+    _split_lines_preserving,
+    _TABLE_SEPARATOR_RE,
+    find_heading_span,
+)
 from src.git.models import CommitInfo
 
 
@@ -68,7 +79,7 @@ class PreviewRenderer:
             )
         )
 
-    def render_empty_response(self, response: AgentResponse) -> None:
+    def render_empty_response(self, plan: ProposedPlan) -> None:
         """AI zwrocilo pusta liste akcji \u2014 informujemy usera i nie pytamy o [T/n]."""
 
         self.console.print()
@@ -77,7 +88,7 @@ class PreviewRenderer:
                 Text.assemble(
                     ("AI uznal, ze ten commit nie wymaga dokumentacji.\n\n", "yellow"),
                     ("Podsumowanie: ", "bold"),
-                    (response.summary, "white"),
+                    (plan.summary, "white"),
                 ),
                 title="Brak akcji",
                 border_style="yellow",
@@ -86,14 +97,29 @@ class PreviewRenderer:
 
     def render_plan(
         self,
-        response: AgentResponse,
+        plan: ProposedPlan,
         plans: list[PlannedVaultWrite],
     ) -> None:
-        """Wyswietla tabele akcji + planow i panele z tresciami."""
+        """Wyswietla tabele pisow + planow i panele z tresciami.
+
+        Pisy na ``_Pending_Concepts.md`` (Faza 6) sa wyjmowane z glownej
+        tabeli i renderowane w dedykowanym panelu "Placeholdery (pending
+        concepts)" \u2014 to notatka-sluga, indeks, nie wezel merytoryczny,
+        wiec user ma ja jako osobny kontekst (a nie mieszana z ADR-ami i
+        modulami).
+        """
 
         self.console.print()
-        self.console.print(Panel(response.summary, title="Podsumowanie AI", border_style="cyan"))
+        self.console.print(Panel(plan.summary, title="Podsumowanie AI", border_style="cyan"))
         self.console.print()
+
+        pending_concept_writes: list[ProposedWrite] = []
+        regular_writes: list[ProposedWrite] = []
+        for write in plan.writes:
+            if write.path == PENDING_CONCEPTS_PATH:
+                pending_concept_writes.append(write)
+            else:
+                regular_writes.append(write)
 
         table = Table(title="Plan zmian do zapisu i commita", show_lines=True)
         table.add_column("#", justify="right", style="dim", width=3)
@@ -102,27 +128,27 @@ class PreviewRenderer:
         table.add_column("Opis", style="white")
 
         row_idx = 1
-        for action in response.actions:
-            type_style = _action_type_style(action.type)
-            description = _action_description(action)
+        for write in regular_writes:
+            type_style = _action_type_style(write.type)
+            description = _action_description(write)
             table.add_row(
                 str(row_idx),
-                Text(action.type.upper(), style=type_style),
-                action.path,
+                Text(write.type.upper(), style=type_style),
+                write.path,
                 description,
             )
             row_idx += 1
 
         if plans:
-            for plan in plans:
-                style = _plan_kind_style(plan.kind)
-                desc = plan.preview_lines[0] if plan.preview_lines else plan.reason
-                if len(plan.preview_lines) > 1:
-                    desc += f" (+{len(plan.preview_lines) - 1} wiecej)"
+            for planned in plans:
+                style = _plan_kind_style(planned.kind)
+                desc = planned.preview_lines[0] if planned.preview_lines else planned.reason
+                if len(planned.preview_lines) > 1:
+                    desc += f" (+{len(planned.preview_lines) - 1} wiecej)"
                 table.add_row(
                     str(row_idx),
-                    Text(plan.kind.upper(), style=style),
-                    plan.path,
+                    Text(planned.kind.upper(), style=style),
+                    planned.path,
                     desc,
                 )
                 row_idx += 1
@@ -130,18 +156,21 @@ class PreviewRenderer:
         self.console.print(table)
         self.console.print()
 
-        if response.actions:
-            self._render_action_contents(response.actions)
+        if regular_writes:
+            self._render_action_contents(regular_writes)
 
         if plans:
             self._render_plan_details(plans)
 
-    def _render_action_contents(self, actions: Iterable[AgentAction]) -> None:
+        if pending_concept_writes:
+            self._render_pending_concepts(pending_concept_writes)
+
+    def _render_action_contents(self, writes: Iterable[ProposedWrite]) -> None:
         self.console.print(Text("Tresc akcji (pierwsze linie):", style="bold"))
         self.console.print()
-        for action in actions:
-            preview = _truncate_content(action.content, _PREVIEW_CONTENT_LINES)
-            title = f"[{action.type.upper()}] {action.path}"
+        for write in writes:
+            preview = _truncate_content(write.content, _PREVIEW_CONTENT_LINES)
+            title = f"[{write.type.upper()}] {write.path}"
             syntax = Syntax(
                 preview,
                 "markdown",
@@ -149,24 +178,80 @@ class PreviewRenderer:
                 line_numbers=False,
                 word_wrap=True,
             )
-            self.console.print(Panel(syntax, title=title, border_style=_action_type_style(action.type)))
+            self.console.print(Panel(syntax, title=title, border_style=_action_type_style(write.type)))
 
     def _render_plan_details(self, plans: Iterable[PlannedVaultWrite]) -> None:
         self.console.print()
         self.console.print(Text("Auto-plan MOC / indeksu:", style="bold"))
         self.console.print()
-        for plan in plans:
-            if plan.preview_lines:
-                body = "\n".join(f"\u2022 {line}" for line in plan.preview_lines)
+        for planned in plans:
+            if planned.preview_lines:
+                body = "\n".join(f"\u2022 {line}" for line in planned.preview_lines)
             else:
-                body = plan.reason
+                body = planned.reason
             self.console.print(
                 Panel(
                     body,
-                    title=f"[{plan.kind.upper()}] {plan.path}",
-                    border_style=_plan_kind_style(plan.kind),
+                    title=f"[{planned.kind.upper()}] {planned.path}",
+                    border_style=_plan_kind_style(planned.kind),
                 )
             )
+
+    def _render_pending_concepts(self, writes: Iterable[ProposedWrite]) -> None:
+        """Dedykowany panel dla pisow na ``_Pending_Concepts.md`` (Faza 6).
+
+        Parsuje tabele ``## Placeholdery`` z finalnej tresci pisu i
+        pokazuje userowi liste zarejestrowanych (lub zaktualizowanych)
+        placeholderow \u2014 bez duzego diffa ADR/hub-stylowego. Gdy z
+        jakichs powodow parsing padnie (niespojny markdown), fallbackujemy
+        do skroconego podgladu tresci.
+        """
+
+        writes_list = list(writes)
+        if not writes_list:
+            return
+
+        self.console.print()
+        self.console.print(Text("Placeholdery (pending concepts):", style="bold"))
+        self.console.print()
+
+        for write in writes_list:
+            rows = _extract_pending_concept_rows(write.content)
+            title = f"[{write.type.upper()}] {write.path}"
+            if rows:
+                body_lines = [
+                    f"\u2022 [bold]{name}[/bold]"
+                    + (f" \u2014 [dim]{', '.join(sources)}[/dim]" if sources else "")
+                    + (f"\n  [italic dim]{hint}[/italic dim]" if hint else "")
+                    for name, sources, hint in rows
+                ]
+                body = "\n".join(body_lines)
+                subtitle = f"{len(rows)} wpis(y) w indeksie placeholderow"
+                self.console.print(
+                    Panel(
+                        body,
+                        title=title,
+                        subtitle=subtitle,
+                        border_style="magenta",
+                    )
+                )
+            else:
+                preview = _truncate_content(write.content, _PREVIEW_CONTENT_LINES)
+                syntax = Syntax(
+                    preview,
+                    "markdown",
+                    theme="monokai",
+                    line_numbers=False,
+                    word_wrap=True,
+                )
+                self.console.print(
+                    Panel(
+                        syntax,
+                        title=title,
+                        subtitle="(nie udalo sie sparsowac tabeli \u2014 pelny podglad)",
+                        border_style="magenta",
+                    )
+                )
 
     def render_execution_report(self, touched_files: list[str], failed: list[str]) -> None:
         """Krotki raport po wykonaniu (sukcesy / bledy) \u2014 przed commitem."""
@@ -298,12 +383,68 @@ def _plan_kind_style(kind: str) -> str:
     return "white"
 
 
-def _action_description(action: AgentAction) -> str:
-    lines = action.content.count("\n") + (1 if action.content and not action.content.endswith("\n") else 0)
-    first_line = action.content.splitlines()[0] if action.content else ""
+def _action_description(write: ProposedWrite) -> str:
+    lines = write.content.count("\n") + (1 if write.content and not write.content.endswith("\n") else 0)
+    first_line = write.content.splitlines()[0] if write.content else ""
     if first_line.startswith("---"):
         first_line = "(frontmatter + ...)"
     return f"{lines} linii, start: {first_line[:60]!r}" if first_line else f"{lines} linii"
+
+
+def _extract_pending_concept_rows(
+    content: str,
+) -> list[tuple[str, list[str], str | None]]:
+    """Parsuje tabele ``## Placeholdery`` w ``_Pending_Concepts.md`` (Faza 6).
+
+    Zwraca liste ``(name, sources, hint)`` per wiersz. Gdy parsing padnie
+    (brak sekcji, brak tabeli, zle komorki) \u2014 zwraca ``[]``: wolajacy
+    fallbackuje do pelnego podgladu tresci.
+
+    Preview chce tej listy bez reszty kolumn \u2014 user ma zobaczyc **kogo
+    zarejestrowano**, nie cala formatke GFM.
+    """
+
+    if not content:
+        return []
+
+    span = find_heading_span(content, PENDING_CONCEPTS_SECTION)
+    if span is None:
+        return []
+
+    lines, _ = _split_lines_preserving(content)
+    in_fence = _iter_code_fence_mask(lines)
+
+    sep_idx: int | None = None
+    i = span.body_start
+    while i < span.body_end - 1:
+        if in_fence[i]:
+            i += 1
+            continue
+        if _parse_pipe_row(lines[i]) is not None and i + 1 < span.body_end:
+            if _TABLE_SEPARATOR_RE.match(lines[i + 1]):
+                sep_idx = i + 1
+                break
+        i += 1
+
+    if sep_idx is None:
+        return []
+
+    rows: list[tuple[str, list[str], str | None]] = []
+    for j in range(sep_idx + 1, span.body_end):
+        if in_fence[j]:
+            break
+        cells = _parse_pipe_row(lines[j])
+        if cells is None or not cells:
+            break
+        name = cells[0].replace(r"\|", "|").strip()
+        if not name:
+            continue
+        sources_raw = cells[1].replace(r"\|", "|").strip() if len(cells) > 1 else ""
+        sources = [s.strip() for s in sources_raw.split(",") if s.strip()]
+        hint_raw = cells[2].replace(r"\|", "|").strip() if len(cells) > 2 else ""
+        hint = hint_raw or None
+        rows.append((name, sources, hint))
+    return rows
 
 
 def _truncate_content(content: str, limit: int) -> str:

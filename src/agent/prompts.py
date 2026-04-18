@@ -19,12 +19,30 @@ PROMPTS_DIR_NAME = "Prompts"
 SUPPORTED_LANGUAGES = ("pl", "en")
 
 
-def load_system_prompt(language: str, *, prompts_dir: Path | None = None) -> str:
+def load_system_prompt(
+    language: str,
+    *,
+    prompts_dir: Path | None = None,
+    examples: dict[str, str] | None = None,
+) -> str:
     """Wczytuje system prompt dla zadanego jezyka i wypelnia placeholdery.
 
-    :param language: kod jezyka z configu (`pl` / `en`). Inne \u2014 ``ValueError``.
+    Obsluguje dwa placeholdery:
+
+    - ``{{language}}`` — etykieta jezyka (``polski`` / ``English``).
+    - ``{{examples}}`` — blok ``<examples>`` z pelnymi notatkami
+      AthleteStack-style (hub, concept, technology, decision, module)
+      uzywany jako few-shot. Jesli placeholder istnieje w pliku a
+      ``examples`` jest ``None`` — loader sam podciaga je przez
+      ``load_all_examples()``. Jesli placeholdera nie ma — blok NIE
+      jest doklejany (kompatybilnosc wsteczna).
+
+    :param language: kod jezyka z configu (`pl` / `en`). Inne — ``ValueError``.
     :param prompts_dir: opcjonalnie nadpisanie katalogu z promptami
         (domyslnie: ``src/agent/Prompts/`` obok tego modulu).
+    :param examples: opcjonalnie gotowy ``{example_name: raw_markdown}``.
+        Gdy prompt zawiera ``{{examples}}`` a argument jest ``None`` —
+        ladowane z ``src/agent/templates.load_all_examples()``.
     :return: gotowy system prompt z podstawionymi placeholderami.
     :raises ValueError: przy nieznanym jezyku lub brakujacym pliku.
     """
@@ -46,7 +64,62 @@ def load_system_prompt(language: str, *, prompts_dir: Path | None = None) -> str
 
     raw = prompt_path.read_text(encoding="utf-8")
     language_label = _language_label(lang)
-    return raw.replace("{{language}}", language_label)
+    resolved = raw.replace("{{language}}", language_label)
+
+    if "{{examples}}" in resolved:
+        if examples is None:
+            from src.agent.templates import load_all_examples
+
+            examples = load_all_examples()
+        resolved = resolved.replace("{{examples}}", _render_examples_block(examples, lang=lang))
+
+    return resolved
+
+
+def _render_examples_block(examples: dict[str, str], *, lang: str) -> str:
+    """Renderuje blok ``<examples>`` z notatkami AthleteStack-style.
+
+    Kolejnosc kluczy w ``examples`` zachowana (tak jak zwraca
+    ``load_all_examples()``). Kazdy przyklad opakowany w tag
+    ``<example_{name}>`` — model widzi jednoznacznie ktory przyklad
+    odpowiada ktoremu typowi.
+
+    Intro w odpowiednim jezyku (PL/EN) tlumaczy ze to **wzorzec**
+    struktury notatki, nie literalnie do skopiowania.
+    """
+
+    if not examples:
+        return ""
+
+    if lang == "pl":
+        intro = (
+            "## Przykłady notatek AthleteStack-style (few-shot)\n\n"
+            "Poniżej pełne notatki pokazujące **wzorzec** dla każdego typu "
+            "obsługiwanego przez dedykowane narzędzia domenowe. Traktuj je "
+            "jako **twardy szablon struktury i tonu** — nie kopiuj treści, "
+            "zaadaptuj do swojego commita."
+        )
+    else:
+        intro = (
+            "## AthleteStack-style note examples (few-shot)\n\n"
+            "Below are full notes showing the **pattern** for every type "
+            "served by dedicated domain tools. Treat them as a **hard "
+            "template for structure and tone** — don't copy content, adapt "
+            "it to your commit."
+        )
+
+    parts: list[str] = ["<examples>", "", intro, ""]
+    for name, content in examples.items():
+        parts.append(f"<example_{name}>")
+        parts.append("")
+        parts.append("```markdown")
+        parts.append(content.rstrip())
+        parts.append("```")
+        parts.append("")
+        parts.append(f"</example_{name}>")
+        parts.append("")
+    parts.append("</examples>")
+    return "\n".join(parts)
 
 
 def load_chunk_instruction_prompt(language: str, *, prompts_dir: Path | None = None) -> str:

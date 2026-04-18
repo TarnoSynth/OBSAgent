@@ -13,13 +13,12 @@ Dostepne (Fazy 5 + 6):
 - ``VaultSnapshot``     \u2014 lekkie zdjecie vaulta na koniec biegu
 - ``AgentStateStore``   \u2014 persystencja ``AgentState`` w ``.agent-state.json``
 
-**Modele akcji AI (Faza 6)**
+**Modele pisow/planow AI (Faza 7 — tool-loop based)**
 
-- ``AgentAction``              \u2014 jedna operacja na vaulcie (create/update/append)
-- ``AgentResponse``            \u2014 pelna odpowiedz AI (summary + lista akcji)
+- ``ProposedWrite``            \u2014 jedna operacja na vaulcie (create/update/append)
+- ``ProposedPlan``             \u2014 pelny plan AI (summary + lista pisow)
+- ``SessionResult``            \u2014 wynik sesji tool-loop (plan + metryki)
 - ``ActionType``               \u2014 ``Literal["create", "update", "append"]``
-- ``SUBMIT_PLAN_TOOL_NAME``    \u2014 nazwa narzedzia tool callingu
-- ``build_submit_plan_schema`` \u2014 generator JSON Schema z modelu Pydantic
 
 **Chunking diffow (Faza 6 \u2014 po refaktorze)**
 
@@ -65,8 +64,24 @@ Pelna **petla iteracyjna** po commitach zyje w ``main.py`` \u2014 ``Agent``
 nie narzuca flow, tylko udostepnia metody (sync, next_commit, prepare,
 propose, preview, execute, commit_vault). Dzieki temu main.py czyta sie
 jak roadmap, a testy moga pomijac interakcje ze stdin.
+
+**Warstwa narzedzi (Faza 0 refaktoru agentic tool loop)**
+
+- ``tools`` (submodule) \u2014 fundamenty petli tool-use. Dostep przez
+  ``from src.agent import tools`` lub ``from src.agent.tools import ...``.
+  W Fazie 0 sam szkielet: ``Tool``, ``ToolResult``, ``ToolRegistry``,
+  ``ToolExecutionContext``. Konkretne narzedzia pojawia sie fazami.
+
+**Warstwa MCP (Faza 1 refaktoru agentic tool loop)**
+
+- ``mcp`` (submodule) \u2014 lokalny serwer Model Context Protocol (streamable-http)
+  wystawiajacy narzedzia z ``ToolRegistry`` na localhost. Dostep przez
+  ``from src.agent import mcp`` lub ``from src.agent.mcp import ...``.
+  Eksporty: ``McpSettings``, ``McpRuntime``, ``McpAgentClient``,
+  ``build_mcp_server``, ``mount_registry_on_mcp``.
 """
 
+from src.agent import mcp, tools
 from src.agent.action_executor import (
     ActionExecutionReport,
     ActionExecutor,
@@ -77,12 +92,10 @@ from src.agent.chunk_cache import ChunkCache
 from src.agent.git_context import GitContextBuilder
 from src.agent.models import AgentState, VaultSnapshot
 from src.agent.models_actions import (
-    SUBMIT_PLAN_TOOL_DESCRIPTION,
-    SUBMIT_PLAN_TOOL_NAME,
     ActionType,
-    AgentAction,
-    AgentResponse,
-    build_submit_plan_schema,
+    ProposedPlan,
+    ProposedWrite,
+    SessionResult,
 )
 from src.agent.models_chunks import (
     ChunkedCommit,
@@ -130,16 +143,12 @@ __all__ = [
     "PENDING_START_MARKER",
     "PREVIOUS_END_MARKER",
     "PREVIOUS_START_MARKER",
-    "SUBMIT_PLAN_TOOL_DESCRIPTION",
-    "SUBMIT_PLAN_TOOL_NAME",
     "ActionExecutionReport",
     "ActionExecutor",
     "ActionOutcome",
     "ActionType",
     "Agent",
-    "AgentAction",
     "AgentConfig",
-    "AgentResponse",
     "AgentState",
     "AgentStateStore",
     "ChunkCache",
@@ -151,13 +160,15 @@ __all__ = [
     "PendingBatch",
     "PlannedVaultWrite",
     "PreviewRenderer",
+    "ProposedPlan",
+    "ProposedWrite",
+    "SessionResult",
     "VaultSnapshot",
     "ask_accept_pending",
     "ask_confirm",
     "ask_retry",
     "build_chunk_summary_prompt",
     "build_finalize_prompt",
-    "build_submit_plan_schema",
     "build_user_prompt",
     "capture_snapshot",
     "has_pending_markers",
@@ -167,10 +178,12 @@ __all__ = [
     "load_finalize_prompt",
     "load_system_prompt",
     "load_template",
+    "mcp",
     "plan_post_action_updates",
     "render_display_content",
     "render_template",
     "restore_from_snapshot",
+    "tools",
     "wrap_pending",
     "wrap_pending_body",
     "wrap_previous_body",
