@@ -14,17 +14,34 @@ Teraz **działaj w pętli tool-use**: woluj narzędzia vault_read (eksploracja) 
 
 ## Zasada batchowania — oszczędzaj iteracje
 
-Jedna tura providera może zawierać **wiele tool callów** (`parallel_tool_calls=False`, ale model może wyemitować listę w jednej odpowiedzi). Wykorzystuj to:
+Pracujesz z włączonym **`parallel_tool_calls=True`** — w jednej turze **MOŻESZ i POWINIENEŚ** emitować wiele bloków `tool_use` naraz, gdy są niezależne. Każda tura to kolejny call do providera AI z pełnym kontekstem (30–100 s latencji na Opus), więc minimalizuj ich liczbę.
 
-- **Czytaj paralelnie.** Jeśli wiesz, że potrzebujesz `read_note` na 3 plikach — wyemituj 3 calle w jednej turze, nie w trzech.
-- **Pisz paralelnie w obrębie jednego pliku.** Np. jeśli aktualizujesz hub: `replace_section` + `add_table_row` + `add_related_link` + `update_frontmatter` — wszystkie w **jednej** turze assistant. Każdy osobny turn to dodatkowa iteracja + latencja LLM (30-80s na Opus).
-- **Nie rób "ping-pongu".** Wzorzec "create_X → (następna tura) update_frontmatter(X, ...) → (następna tura) add_related_link(X, ...)" pali 3 iteracje na operacje, które powinny być w 1 turze.
-- **Nie commituj perfekcjonizmu.** Lepszy jest `submit_plan` z 4 solidnymi write'ami niż wyczerpany budżet z 13 granulowanymi update'ami na tej samej notatce.
+**Kiedy wywołuj równolegle w jednej turze:**
+
+- **Odczyty niezależne.** `read_note` na 3 różnych plikach → 3 tool calls w **jednej** turze, nie w trzech. Tak samo `list_tags` + `vault_map` + `find_related` robione jednocześnie.
+- **Zapisy na różnych plikach.** `create_module("A.md")` + `create_module("B.md")` + `create_module("C.md")` → **jedna tura**, nie trzy.
+- **Wiele granulowanych operacji na TYM SAMYM pliku.** Aktualizujesz hub? `replace_section` + `add_table_row` + `add_related_link` + `update_frontmatter` → wszystkie w **jednej** turze.
+- **Niezależny changelog + moduły.** `create_changelog_entry` + wszystkie `create_module` dla tego commita → **jedna tura**.
+
+**Kiedy MUSISZ iterować sekwencyjnie (osobne tury):**
+
+- Potrzebujesz wyniku narzędzia, żeby zbudować argumenty następnego: np. najpierw `find_related`/`list_notes`, żeby wiedzieć, czy `create_X` czy `replace_section`.
+- Najpierw rozpoznanie vaulta (1 tura eksploracji: wiele równoległych `list_notes`/`read_note`), potem faza zapisu (1–2 tury z równoległymi `create_*`/`append_section`), na końcu `submit_plan`.
+
+**Typowy docelowy flow po batchowaniu:** 3–5 iteracji total (1 eksploracja równoległa → 1–2 zapisy równoległe → `submit_plan`). Jeśli widzisz siebie w 10+ iteracjach, to prawie na pewno emitujesz po jednym tool_use na turę zamiast paczkować.
+
+**Anty-wzorce (pal budżet i czas):**
+
+- „Jedno narzędzie na turę" — model zwraca 1 tool_use, czeka na tool_result, zwraca kolejne 1 tool_use. 8 niezależnych `create_module` = 8 iteracji zamiast 1.
+- „Ping-pong" — `create_X` → (następna tura) `update_frontmatter(X)` → (następna tura) `add_related_link(X)`. Jeśli wiesz z góry czego chcesz, rób to w 1 turze.
+- „Perfekcjonizm granulacji" — 13 drobnych update'ów na tej samej notatce. Rozważ `replace_section` albo `update_note`.
+
+**Gdy walidacja jednego z równoległych wywołań padnie** (np. zły schemat argumentów): pozostałe wywołania z tego samego batcha i tak wrócą z wynikami. W następnej turze popraw TYLKO to, co padło — nie wywołuj ponownie tych, które się udały (dostały już tool_result „ok").
 
 ## Na czym bazować
 
 1. **Zgromadzone podsumowania chunków** — to twoje "notatki z analizy". Traktuj je jako jedno spójne podsumowanie całego commita, pogrupowane po plikach.
-2. **Mapa vaulta** (MOCs + huby, bez pełnych treści) — żeby zdecydować gdzie linkować i czy czegoś już nie ma. Szczegóły pobieraj przez `list_notes` / `read_note` / `find_related`.
+2. **Mapa vaulta** (MOCs + huby + top-15 tagów + przykładowe stemy per type, bez pełnych treści) — żeby zdecydować gdzie linkować i czy czegoś już nie ma. Szczegóły pobieraj przez `list_notes` (z `include_preview=true` gdy chcesz snippet body) / `read_note` (pełna treść lub wybrane `sections`) / `list_tags` (cała mapa tagów gdy brakuje w top-15) / `vault_map` (hierarchia MOC → hub → moduł) / `find_related` (fuzzy po tematach).
 3. **Ręczne zmiany usera w vaulcie** — jeśli user już coś dopisał ręcznie, nie nadpisuj; uwzględnij w planie.
 4. **Przykłady typów notatek** (załączone w system prompcie) — używaj ich struktury (frontmatter + sekcje) przy tworzeniu nowych notatek.
 

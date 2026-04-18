@@ -22,6 +22,7 @@ zawola terminator ``submit_plan``. Retry 2x z bledem w prompcie (Q5).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,7 @@ from src.agent.tools import (
     GetCommitContextTool,
     ListNotesTool,
     ListPendingConceptsTool,
+    ListTagsTool,
     ReadNoteTool,
     RegisterPendingConceptTool,
     ReplaceSectionTool,
@@ -70,6 +72,7 @@ from src.agent.tools import (
     ToolResult,
     UpdateFrontmatterTool,
     UpdateNoteTool,
+    VaultMapTool,
 )
 from src.agent.models import AgentState, VaultSnapshot
 from src.agent.models_actions import (
@@ -922,7 +925,7 @@ class Agent:
                     messages=messages,
                     tools=tool_definitions,
                     tool_choice=tool_choice_value,
-                    parallel_tool_calls=False,
+                    parallel_tool_calls=True,
                 )
 
                 with llm_call_context(call_ctx):
@@ -968,9 +971,39 @@ class Agent:
                         force_last_n=force_last_n,
                     )
 
-                for tool_call in result.tool_calls:
-                    tool_calls_total += 1
-                    tool_result = await self._dispatch_via_mcp(tool_call)
+                # Rownolegly dispatch tool_calls z jednej tury modelu.
+                # Model (przy `parallel_tool_calls=True`) moze wyemitowac wiele
+                # tool_use w jednej odpowiedzi (np. 8x create_module). Dispatchujemy
+                # je przez asyncio.gather, zeby I/O do MCP (HTTP streamable) leciało
+                # wspolbieznie - zamiast sumy latencji dostajemy max z latencji.
+                #
+                # Kolejnosc tool_result w `messages` MUSI odpowiadac kolejnosci
+                # tool_use w odpowiedzi asystenta (wymog Anthropic/OpenAI tool
+                # protocol). Uzywamy `zip(result.tool_calls, results)` po gather -
+                # to daje deterministyczne ulozenie niezaleznie od tego, ktore
+                # narzedzie skonczylo pierwsze.
+                #
+                # Race na `ctx` (proposed_writes.append, invalidate_vault_knowledge):
+                # wszystkie dispatch'e zyja w jednym event loop (asyncio jest
+                # single-thread), a kazda operacja na liscie/atrybucie jest
+                # atomowa w obrebie pojedynczego kroku awaitowego. Niedeterminizm
+                # dotyczy tylko *wzglednej* kolejnosci appendow pomiedzy
+                # narzedziami biegnacymi rownoczesnie w tej turze - gdy sa to
+                # operacje na roznych plikach (typowy batch create_module na
+                # nieistniejacych modulach), kolejnosc nie ma znaczenia.
+                # Gdy beda na tym samym pliku (np. create_X + append_section(X)),
+                # model sam powinien rozbic na dwie tury (bo append wymaga
+                # create juz w `ctx.has_pending_create`), a nawet gdyby tego
+                # nie zrobil, `apply_pending` aplikuje sekwencyjnie w kolejnosci
+                # w jakiej sa w liscie - ewentualne przestawienie zglosi blad
+                # przez preconditions (FileNotFoundError przy append).
+                tool_calls_total += len(result.tool_calls)
+                dispatch_coros = [
+                    self._dispatch_via_mcp(tool_call) for tool_call in result.tool_calls
+                ]
+                dispatch_results = await asyncio.gather(*dispatch_coros)
+
+                for tool_call, tool_result in zip(result.tool_calls, dispatch_results):
                     content = tool_result.to_model_text()
                     if budget_hint_suffix:
                         content = f"{content}{budget_hint_suffix}"
@@ -1517,9 +1550,12 @@ def _register_default_tools(registry: ToolRegistry) -> None:
 
     **Faza 4 - eksploracja vaulta (read-only):**
 
-    - ``list_notes`` - filtruj po type/tag/parent/path_prefix (cache per sesja).
+    - ``list_notes`` - filtruj po type/parent/path_prefix + multi-tag
+      (tags_any/tags_all/tags_none) + opcjonalny ``include_preview``.
     - ``read_note`` - tresc notatki + wikilinks_in/out; opcjonalnie wybrane sekcje.
     - ``find_related`` - fuzzy search po stem/title/tagach/headingach.
+    - ``list_tags`` - mapa tagow z licznikami + top_paths per tag (Faza 5).
+    - ``vault_map`` - drzewo MOC -> hub -> modul w jednym wywolaniu (Faza 5).
     - ``list_pending_concepts`` - orphan wikilinki (placeholdery do wypelnienia).
     - ``get_commit_context`` - metadane biezacego commita (SHA, pliki, stats).
 
@@ -1556,6 +1592,8 @@ def _register_default_tools(registry: ToolRegistry) -> None:
     registry.register(ListNotesTool())
     registry.register(ReadNoteTool())
     registry.register(FindRelatedTool())
+    registry.register(ListTagsTool())
+    registry.register(VaultMapTool())
     registry.register(ListPendingConceptsTool())
     registry.register(RegisterPendingConceptTool())
     registry.register(GetCommitContextTool())

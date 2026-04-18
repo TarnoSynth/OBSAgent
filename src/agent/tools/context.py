@@ -32,11 +32,31 @@ wszystkie wywolania narzedzi (od pierwszego ``list_notes`` do koncowego
 
 **Thread safety:**
 
-Context NIE jest thread-safe. Jedna sesja agenta jest sekwencyjna:
-model wola narzedzia, kazde uruchamiane po kolei, nawet gdy provider
-zwroci parallel_tool_calls \u2014 ``ToolRegistry.dispatch`` je awaituje
-po kolei. Gdyby kiedys zmienilismy model wywolan na concurrent, trzeba
-bedzie zalozyc lock na invalidacji cache'a.
+Context NIE jest thread-safe w klasycznym sensie (nie zaklada lockow),
+ale od kiedy agent dispatchuje ``parallel_tool_calls=True`` przez
+``asyncio.gather`` w ``_run_tool_loop``, rowne wywolania narzedzi
+z jednej tury modelu lecą **wspolbieznie** w jednym event loopie.
+
+Dlaczego to jest bezpieczne bez lockow:
+
+- asyncio jest single-thread - brak preemptive context switch w srodku
+  operacji synchronicznej. ``list.append``, ``dict[k]=v``, proste
+  przypisanie atrybutu sa atomowe wzgledem innych korutyn.
+- Niedeterministyczna moze byc tylko *wzgledna* kolejnosc appendow
+  (``proposed_writes``, ``executed_actions``) miedzy narzedziami, ktore
+  zrownolegle czekaja na I/O. Dla zapisu na dysk to nie ma znaczenia,
+  bo ``ActionExecutor.apply_pending`` ma wlasna deterministyczna
+  kolejnosc (po kolejnosci rejestracji w liscie).
+- ``invalidate_vault_knowledge`` + ``ensure_vault_knowledge`` mogly by
+  teoretycznie zrobic double-build przy race (dwa tools jednoczesnie
+  sprawdzaja ``vault_knowledge is None``). Worst case: drugi build
+  nadpisuje pierwszy - dane sa spojne, tylko wykonalismy jeden skan
+  vaulta za duzo. Akceptowalne; ewentualny ``asyncio.Lock`` wokol
+  ``scan_all`` jest mozliwy gdyby to sie stalo bottleneckiem.
+
+Jesli w przyszlosci dopuscimy **true** wielowatkowosc (np. multiprocessing,
+thread pool narzedzi I/O-heavy) - wtedy tak, trzeba bedzie lockowac
+``proposed_writes`` i ``vault_knowledge``.
 """
 
 from __future__ import annotations

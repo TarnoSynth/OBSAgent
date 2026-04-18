@@ -14,17 +14,34 @@ Now **work in a tool-use loop**: call vault_read tools (exploration) and vault_w
 
 ## Batching rule — save iterations
 
-One provider turn can contain **multiple tool calls** (`parallel_tool_calls=False`, but the model can emit a list in a single response). Use this:
+You run with **`parallel_tool_calls=True`** — in one turn you **CAN and SHOULD** emit multiple `tool_use` blocks at once whenever they are independent. Each turn is a full provider AI call with the accumulated context (30–100s latency on Opus), so minimize the number of turns.
 
-- **Read in parallel.** If you know you need `read_note` on 3 files — emit 3 calls in one turn, not three.
-- **Write in parallel within one file.** E.g. when updating a hub: `replace_section` + `add_table_row` + `add_related_link` + `update_frontmatter` — all in **one** assistant turn. Each separate turn is an extra iteration + LLM latency (30-80s on Opus).
-- **Don't ping-pong.** The pattern "create_X → (next turn) update_frontmatter(X, ...) → (next turn) add_related_link(X, ...)" burns 3 iterations on operations that should be in 1 turn.
-- **Don't commit perfectionism.** `submit_plan` with 4 solid writes is better than an exhausted budget with 13 granular updates on the same note.
+**When to call in parallel (same turn):**
+
+- **Independent reads.** `read_note` on 3 different files → 3 tool calls in **one** turn, not three turns. Same for `list_tags` + `vault_map` + `find_related` done together.
+- **Writes on different files.** `create_module("A.md")` + `create_module("B.md")` + `create_module("C.md")` → **one** turn, not three.
+- **Multiple granular ops on the SAME file.** Updating a hub? `replace_section` + `add_table_row` + `add_related_link` + `update_frontmatter` all in **one** turn.
+- **Changelog + modules together.** `create_changelog_entry` + all `create_module` for this commit → **one** turn.
+
+**When you MUST iterate sequentially (separate turns):**
+
+- You need the result of one tool to build arguments for the next: e.g. `find_related`/`list_notes` first to decide between `create_X` and `replace_section`.
+- Standard pattern: 1 exploration turn (many parallel `list_notes`/`read_note`), then 1–2 write turns (parallel `create_*`/`append_section`), then `submit_plan`.
+
+**Target flow after batching:** 3–5 iterations total (1 parallel exploration → 1–2 parallel writes → `submit_plan`). If you're at 10+ iterations, you are almost certainly emitting one tool_use per turn instead of batching.
+
+**Anti-patterns (burn budget and time):**
+
+- "One tool per turn" — model returns 1 tool_use, waits for tool_result, returns the next 1 tool_use. 8 independent `create_module` calls = 8 iterations instead of 1.
+- "Ping-pong" — `create_X` → (next turn) `update_frontmatter(X)` → (next turn) `add_related_link(X)`. If you know upfront what you want, do it in 1 turn.
+- "Granular perfectionism" — 13 tiny updates to the same note. Consider `replace_section` or `update_note`.
+
+**If one parallel call fails validation** (e.g. bad argument schema): the other calls in the same batch still return their results. In the next turn, fix ONLY the failed call — do not re-issue the ones that succeeded (they already got an "ok" tool_result).
 
 ## What to base the plan on
 
 1. **Collected chunk summaries** — these are your "analysis notes". Treat them as one coherent summary of the whole commit, grouped by files.
-2. **Vault map** (MOCs + hubs, without full content) — to decide where to link and whether something already exists. Pull details via `list_notes` / `read_note` / `find_related`.
+2. **Vault map** (MOCs + hubs + top-15 tags + sample stems per type, without full content) — to decide where to link and whether something already exists. Pull details via `list_notes` (with `include_preview=true` when you want a body snippet) / `read_note` (full content or selected `sections`) / `list_tags` (complete tag map when missing from top-15) / `vault_map` (MOC → hub → module hierarchy) / `find_related` (fuzzy by topic).
 3. **Manual user changes in the vault** — if user already wrote something manually, don't overwrite; incorporate into the plan.
 4. **Note type examples** (attached in the system prompt) — use their structure (frontmatter + sections) when creating new notes.
 

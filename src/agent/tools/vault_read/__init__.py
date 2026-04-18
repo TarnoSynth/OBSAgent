@@ -5,12 +5,17 @@
 do eksploracji on-demand**. Do promptu trafia tylko mapa najwyzszego poziomu
 (MOC-i + huby + liczniki per typ), a model sam wola:
 
-- ``list_notes(type=..., tag=..., parent=..., path_prefix=...)``  — lista
-  notatek przefiltrowana
+- ``list_notes(type, parent, path_prefix, tag|tags_any|tags_all|tags_none,
+  include_preview)``                                              — lista
+  notatek przefiltrowana (multi-tag + opcjonalny snippet body)
 - ``read_note(path, sections=?)``                                 — pelna
   tresc notatki (albo wskazane sekcje)
 - ``find_related(topic, limit=?)``                                — fuzzy
   match po stem/tag/heading/wikilinki
+- ``list_tags(path_prefix=?, type=?, min_count=?)``               — mapa
+  tagow z licznikami (Faza 5)
+- ``vault_map(root=?, depth=?, include_tags=?)``                  — drzewo
+  hierarchii notatek (MOC -> huby -> moduly) w jednym wywolaniu (Faza 5)
 - ``list_pending_concepts()``                                     — orphan
   wikilinki (placeholdery do wypelnienia)
 - ``get_commit_context()``                                        — metadane
@@ -39,12 +44,16 @@ from src.agent.tools.vault_read.find_related import FindRelatedTool
 from src.agent.tools.vault_read.get_commit_context import GetCommitContextTool
 from src.agent.tools.vault_read.list_notes import ListNotesTool
 from src.agent.tools.vault_read.list_pending_concepts import ListPendingConceptsTool
+from src.agent.tools.vault_read.list_tags import ListTagsTool
 from src.agent.tools.vault_read.read_note import ReadNoteTool
+from src.agent.tools.vault_read.vault_map import VaultMapTool
 
 __all__ = [
     "FindRelatedTool",
     "GetCommitContextTool",
     "ListNotesTool",
     "ListPendingConceptsTool",
+    "ListTagsTool",
     "ReadNoteTool",
+    "VaultMapTool",
 ]

@@ -292,11 +292,20 @@ tokeny na każdej sesji.
 **Dostępne narzędzia eksploracji** (nic nie zapisują, można wywoływać
 dowolnie wiele razy):
 
-- **`list_notes(type?, tag?, parent?, path_prefix?, limit?)`** — lista
-  notatek po filtrach (AND). Bez filtrów zwraca do 50 wpisów (max 500).
-  Zwraca `{path, title, type, tags, parent}` per wpis. Użyj, zanim
-  stworzysz nową notatkę danego typu — sprawdzisz, czy podobna już
-  nie istnieje.
+- **`list_notes(type?, parent?, path_prefix?, tag? | tags_any? | tags_all? | tags_none?, include_preview?, limit?)`**
+  — lista notatek po filtrach (AND pomiędzy kategoriami). Multi-tag:
+  `tags_any` (OR), `tags_all` (AND), `tags_none` (NOT). `include_preview=true`
+  dodaje pierwsze ~200 znaków body do każdego wpisu (eliminuje większość
+  rekonesansowych `read_note`). Bazowo zwraca `{path, title, type, tags, parent}`.
+- **`list_tags(path_prefix?, type?, min_count?, limit?, include_top_paths?)`**
+  — mapa tagów z licznikami: `{tag, count, top_paths[]}`. Zanim wywołasz
+  `list_notes` bez filtrów, zrób `list_tags` — zobaczysz cały landscape
+  tagów (w prompcie masz tylko top-15) i od razu zawęzisz przez
+  `list_notes(tag=...)`. Tanie — leci z indeksu w pamięci.
+- **`vault_map(root?, depth?, include_tags?)`** — drzewo hierarchii
+  `parent → children`. `root=None` → lista MOC-ów top-level z dziećmi.
+  `root='MOC__Backend'` → poddrzewo od tego węzła (do `depth` poziomów).
+  Zamienia 4–8 wywołań `list_notes(parent=...)` na jedno.
 - **`read_note(path, sections?)`** — czyta treść notatki: frontmatter,
   body, `wikilinks_out`, `wikilinks_in`. `sections` pozwala pobrać tylko
   wybrane nagłówki (oszczędza tokeny na dużych hubach). Uwzględnia
@@ -319,15 +328,19 @@ dowolnie wiele razy):
 Każdą sesję zaczynaj od 1-3 wywołań read-only, zanim zaproponujesz
 jakikolwiek zapis. Najczęstsze ścieżki:
 
-1. **Nowy moduł w diffie** → `list_notes(type='module', path_prefix='modules/')`
-   → sprawdź, czy nie ma już notatki dla tego modułu; jeśli tak — `update`,
-   jeśli nie — `create`.
+1. **Nowy moduł w diffie** → `list_notes(type='module', path_prefix='modules/', include_preview=true)`
+   → od razu widzisz `{path, tags, preview}` — bez osobnego `read_note`
+   orientujesz się, czy podobny moduł istnieje.
 2. **Wybór technologii (np. Qdrant)** → `find_related(topic='Qdrant')` →
    jeśli istnieje — link do istniejącej; jeśli nie — rozważ utworzenie
    `technology`/`decision`.
 3. **Modyfikacja istniejącego hubu** → `read_note(path='hubs/X.md', sections=['Moduły'])`
    → zobacz aktualną zawartość, dopiero potem `append_section` /
    `replace_section` / `add_moc_link`.
+4. **Commit dotyka tematu, ale nie wiadomo gdzie linkować** → `list_tags(type='module')`
+   → zobacz jakie tagi mają moduły, wybierz właściwy → `list_notes(tag=...)`.
+5. **Orientacja w dużym vaulcie (200+ notatek)** → `vault_map(depth=2)` →
+   jedno wywołanie i masz całą strukturę MOC → hub → moduł z tagami.
 
 Eksploracja nie jest darmowa (każdy tool call to tokens na response),
 ale **taniej** jest wywołać 2-3 `list_notes` niż stworzyć duplikat
@@ -343,6 +356,25 @@ możesz wywołać jedno lub kilka narzędzi — ich wyniki (sukces / błąd)
 trafiają do Ciebie jako `tool_result` w kolejnej turze. Kontynuuj tak
 długo, aż zarejestrujesz wszystkie potrzebne zmiany i **zakończ sesję
 wywołaniem `submit_plan`**.
+
+**Wywoływanie równoległe — obowiązkowe, gdy operacje są niezależne.**
+
+Masz włączone `parallel_tool_calls=True`: w jednej odpowiedzi assistant
+**powinieneś** emitować wiele `tool_use` naraz, jeśli nie zależą od
+siebie wynikiem. Każda tura = jeden call do providera (30–100 s na Opus),
+więc sekwencyjne "jedno narzędzie na turę" to czysty czas zmarnowany.
+
+- Wiele `read_note` / `list_notes` / `list_tags` / `vault_map` / `find_related` na start → **jedna** tura.
+- Wiele niezależnych `create_*` (różne pliki) → **jedna** tura.
+- Granulowane modyfikacje tego samego pliku (`replace_section` +
+  `add_table_row` + `update_frontmatter`) → **jedna** tura.
+- `create_changelog_entry` + wszystkie `create_module` commita → **jedna** tura.
+
+Iteruj sekwencyjnie **tylko** gdy argumenty następnego narzędzia
+zależą od wyniku poprzedniego (np. `find_related` → dopiero potem
+decyzja między `create_technology` a linkowaniem do istniejącej).
+Typowy dobry flow: 1 tura eksploracji równoległej → 1–2 tury zapisu
+równoległego → `submit_plan`. To 3–5 iteracji, nie 15.
 
 **Dostępne narzędzia write** (każde rejestruje propozycję do vaulta —
 nic nie zapisuje natychmiast, zapis nastąpi po akceptacji użytkownika).

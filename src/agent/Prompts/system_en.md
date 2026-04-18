@@ -285,11 +285,21 @@ on every session.
 
 **Available exploration tools** (read-only, callable as many times as needed):
 
-- **`list_notes(type?, tag?, parent?, path_prefix?, limit?)`** — filtered
-  list of notes (AND across filters). Without filters, returns up to 50
-  entries (max 500). Returns `{path, title, type, tags, parent}` per
-  entry. Use before creating a new note of a given type — to check
-  whether a similar one already exists.
+- **`list_notes(type?, parent?, path_prefix?, tag? | tags_any? | tags_all? | tags_none?, include_preview?, limit?)`**
+  — filtered list of notes (AND across filter categories). Multi-tag:
+  `tags_any` (OR), `tags_all` (AND), `tags_none` (NOT). `include_preview=true`
+  adds the first ~200 chars of body to each entry (eliminates most
+  reconnaissance `read_note` calls). Default returns `{path, title, type,
+  tags, parent}` per entry.
+- **`list_tags(path_prefix?, type?, min_count?, limit?, include_top_paths?)`**
+  — tag map with counts: `{tag, count, top_paths[]}`. Before running
+  `list_notes` without filters, call `list_tags` — you'll see the full
+  tag landscape (the prompt only shows top-15) and narrow down with
+  `list_notes(tag=...)`. Cheap — served from the in-memory index.
+- **`vault_map(root?, depth?, include_tags?)`** — hierarchy tree
+  `parent → children`. `root=None` → top-level MOCs with direct children.
+  `root='MOC__Backend'` → subtree from that node (down to `depth` levels).
+  Replaces 4–8 `list_notes(parent=...)` calls with one.
 - **`read_note(path, sections?)`** — reads a note's content: frontmatter,
   body, `wikilinks_out`, `wikilinks_in`. `sections` lets you pull only
   selected headings (saves tokens on big hubs). Respects pending writes
@@ -312,15 +322,19 @@ on every session.
 Start each session with 1-3 read-only calls before proposing any write.
 Common paths:
 
-1. **New module in the diff** → `list_notes(type='module', path_prefix='modules/')`
-   → check if there's already a note for this module; if yes — `update`,
-   if not — `create`.
+1. **New module in the diff** → `list_notes(type='module', path_prefix='modules/', include_preview=true)`
+   → immediately see `{path, tags, preview}` — no separate `read_note`
+   needed to tell if a similar module exists.
 2. **Technology choice (e.g. Qdrant)** → `find_related(topic='Qdrant')`
    → link to existing if found; otherwise consider creating a
    `technology`/`decision` note.
 3. **Modifying an existing hub** → `read_note(path='hubs/X.md', sections=['Modules'])`
    → see current content, then `append_section` / `replace_section` /
    `add_moc_link`.
+4. **Commit touches a topic but not sure where to link** → `list_tags(type='module')`
+   → see which tags modules use, pick the right one → `list_notes(tag=...)`.
+5. **Orienting in a large vault (200+ notes)** → `vault_map(depth=2)` →
+   one call gives the entire MOC → hub → module structure with tags.
 
 Exploration isn't free (each tool call costs response tokens), but it is
 **cheaper** to run 2-3 `list_notes` than to create a duplicate and force
@@ -335,6 +349,25 @@ You work **iteratively** by calling tools. In each turn you may call
 one or more tools — their results (success / error) come back to you
 as `tool_result` in the next turn. Keep going until all needed changes
 are registered and **end the session by calling `submit_plan`**.
+
+**Parallel tool calls — mandatory when operations are independent.**
+
+You have `parallel_tool_calls=True`: in a single assistant response
+you **should** emit multiple `tool_use` blocks at once whenever they
+do not depend on each other's result. Each turn is one provider call
+(30–100s on Opus), so sequential "one tool per turn" is pure wasted time.
+
+- Multiple `read_note` / `list_notes` / `list_tags` / `vault_map` / `find_related` on start → **one** turn.
+- Multiple independent `create_*` (different files) → **one** turn.
+- Granular edits to the same file (`replace_section` +
+  `add_table_row` + `update_frontmatter`) → **one** turn.
+- `create_changelog_entry` + all `create_module` for the commit → **one** turn.
+
+Iterate sequentially **only** when the next tool's arguments depend
+on the result of the previous one (e.g. `find_related` → then decide
+between `create_technology` and linking to an existing note).
+Good target flow: 1 parallel exploration turn → 1–2 parallel write
+turns → `submit_plan`. That's 3–5 iterations, not 15.
 
 **Available write tools** (each registers a proposed change — nothing
 is written immediately, the writes happen after user approval).

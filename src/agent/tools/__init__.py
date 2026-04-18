@@ -52,7 +52,9 @@ from src.agent.tools.vault_read import (
     GetCommitContextTool,
     ListNotesTool,
     ListPendingConceptsTool,
+    ListTagsTool,
     ReadNoteTool,
+    VaultMapTool,
 )
 from src.agent.tools.vault_write import (
     AddMocLinkTool,
@@ -90,6 +92,7 @@ __all__ = [
     "GetCommitContextTool",
     "ListNotesTool",
     "ListPendingConceptsTool",
+    "ListTagsTool",
     "ReadNoteTool",
     "RegisterPendingConceptTool",
     "ReplaceSectionTool",
@@ -100,4 +103,5 @@ __all__ = [
     "ToolResult",
     "UpdateFrontmatterTool",
     "UpdateNoteTool",
+    "VaultMapTool",
 ]

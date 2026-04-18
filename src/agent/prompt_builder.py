@@ -55,6 +55,22 @@ Vault AthleteStack-style ma 10-30 hubow. Powyzej 40 lista staje sie
 nieprzydatna — agent i tak powinien szukac po filtrach, nie skanowac
 wizualnie."""
 
+_MAX_TOP_TAGS = 15
+"""Ile najpopularniejszych tagow listujemy w mapie top-level.
+
+Dajemy modelowi landscape tagow zamiast samego licznika — dzieki temu
+pierwsze wywolanie ``list_notes``/``list_tags`` moze od razu zawezic
+przez ``tag=`` zamiast dumpowac caly vault. 15 tagow ~200 tokenow,
+laczy sie z prompt cachingiem (stabilny prefiks miedzy commitami)."""
+
+_MAX_TYPE_EXAMPLES = 5
+"""Ile przykladowych stemow dopisujemy do kazdego typu w mapie top-level.
+
+Np. ``module (15): Auth, Billing, Checkout, Notifications, Payments
+(i 10 wiecej)``. Model od razu widzi "Auth juz istnieje jako modul" i
+nie dubluje. Wiecej niz 5 stemow = szum, model zacznie je kopiowac
+zamiast wolac ``list_notes``."""
+
 
 def build_user_prompt(
     *,
@@ -525,6 +541,28 @@ def _section_vault_knowledge(knowledge: VaultKnowledge) -> str:
         )
         counts_str = ", ".join(f"`{t}`: {n}" for t, n in counts)
         lines.append(f"- **Notatki per type:** {counts_str}")
+        lines.append("")
+
+        lines.append("### Typy — przykladowe notatki (zanim zaproponujesz duplikat)")
+        for note_type, total in counts:
+            paths = sorted(knowledge.by_type.get(note_type, []))
+            stems = [Path(p).stem for p in paths[:_MAX_TYPE_EXAMPLES]]
+            overflow = total - len(stems)
+            stems_str = ", ".join(f"`[[{s}]]`" for s in stems) if stems else "-"
+            suffix = f" _(+{overflow} wiecej — uzyj `list_notes(type='{note_type}')`)_" if overflow > 0 else ""
+            lines.append(f"- **`{note_type}`** ({total}): {stems_str}{suffix}")
+        lines.append("")
+
+    if knowledge.by_tag:
+        top_tags = sorted(
+            ((tag, len(paths)) for tag, paths in knowledge.by_tag.items()),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+        visible = top_tags[:_MAX_TOP_TAGS]
+        tags_str = ", ".join(f"`{t}`: {n}" for t, n in visible)
+        overflow = len(top_tags) - len(visible)
+        suffix = f" _(+{overflow} rzadszych — uzyj `list_tags` zeby zobaczyc pelna mape)_" if overflow > 0 else ""
+        lines.append(f"- **Top tagi** (top {len(visible)}/{len(top_tags)}): {tags_str}{suffix}")
         lines.append("")
 
     mocs = knowledge.mocs()
