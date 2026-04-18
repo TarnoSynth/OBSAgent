@@ -37,6 +37,29 @@ class TagInconsistency(BaseModel):
     expected_tag: str
 
 
+class StructuralViolation(BaseModel):
+    """Twarda reguła strukturalna notatki ktora zostala zlamana.
+
+    Od Fazy 5 refaktoru (styl AthleteStack) kazdy typ notatki ma
+    wlasny kontrakt — nie sprowadza sie juz do "mam tag = mam typ".
+    Przyklady reguły:
+
+    - ``type: hub`` MUSI miec tag ``hub`` we frontmatterze.
+    - ``type: decision`` MUSI miec ``parent`` (wskazanie huba do
+      ktorego nalezy ADR).
+    - ``type: technology`` MUSI miec pole ``role`` we frontmatterze
+      (krotki opis roli technologii w systemie).
+
+    ``rule`` to maszyno-czytelny identyfikator (np. ``"decision_requires_parent"``),
+    ``message`` to human-readable opis co dokladnie brakuje.
+    """
+
+    note_path: str
+    note_type: str
+    rule: str
+    message: str
+
+
 class ConsistencyReport(BaseModel):
     """Raport spojnosci grafu vaulta.
 
@@ -70,6 +93,15 @@ class ConsistencyReport(BaseModel):
     inconsistent_tags: list[TagInconsistency] = Field(default_factory=list)
     """Notatka o danym ``type`` ktora nie ma tagu o tej samej nazwie."""
 
+    structural_violations: list[StructuralViolation] = Field(default_factory=list)
+    """Twarde naruszenia kontraktow per-typ (Faza 5 refaktoru).
+
+    W odroznieniu od ``inconsistent_tags`` (gdzie brak tagu to drobny
+    higieniczny problem) — tu lecą **blędy strukturalne**: notatka
+    istnieje ale nie spelnia kontraktu swojego typu (np. ``decision``
+    bez ``parent``, ``technology`` bez pola ``role``).
+    """
+
     @property
     def total_issues(self) -> int:
         """Suma wszystkich problemow we wszystkich kategoriach."""
@@ -79,6 +111,7 @@ class ConsistencyReport(BaseModel):
             + len(self.dead_links)
             + len(self.missing_in_moc)
             + len(self.inconsistent_tags)
+            + len(self.structural_violations)
         )
 
     @property
@@ -88,7 +121,65 @@ class ConsistencyReport(BaseModel):
         return self.total_issues == 0
 
 
-_TYPES_REQUIRING_MOC = {"module", "adr", "doc", "changelog"}
+#: Zbior **kanonicznych** typow notatek rozpoznawanych przez warstwe vault.
+#: Trzyma oryginalna kapitalizacje \u2014 modul/ADR/MOC sa takie same jak w
+#: frontmatterze zapisywanym do pliku. Uzywany:
+#:
+#: - przez walidatory/narzedzia ``create_*`` (Faza 4) jako whitelist,
+#: - przez ``_find_inconsistent_tags`` (ponizej) posrednio \u2014 ale to
+#:   sprawdzanie iteruje po wszystkich ``note.type``, wiec nowe typy
+#:   sa automatycznie objete reguly ``tag == type.lower()``.
+#:
+#: Faza 0 refaktoru agentic tool loop dodaje: ``hub``, ``concept``,
+#: ``technology``, ``decision`` \u2014 styl AthleteStack.
+KNOWN_TYPES: frozenset[str] = frozenset(
+    {
+        "ADR",
+        "MOC",
+        "changelog",
+        "concept",
+        "decision",
+        "doc",
+        "hub",
+        "module",
+        "technology",
+    }
+)
+
+
+def is_known_type(note_type: str | None) -> bool:
+    """Czy podany ``type`` jest jedna z kanonicznych wartosci.
+
+    Case-sensitive \u2014 ``"ADR"`` jest znane, ``"adr"`` nie (bo w kanonicznej
+    formie piszemy ADR wielkimi literami). Caller moze znormalizowac
+    wartosc przed sprawdzeniem, jesli potrzebuje.
+
+    Uzywane przez warstwe narzedzi (Faza 4) do walidacji przed zapisem.
+    Tutaj wystawione, zeby jedna lista typow byla zrodlem prawdy dla
+    calego projektu.
+    """
+
+    if note_type is None:
+        return False
+    return note_type in KNOWN_TYPES
+
+
+#: Typy notatek, ktore MUSZA miec parent wskazujacy na MOC (wykryje brak
+#: jako ``missing_in_moc`` w ``ConsistencyReport``). ``changelog`` jest tu
+#: swiadomie \u2014 kazdy wpis changeloga ma MOC nadrzedny (np. ``MOC___Changelog``
+#: jesli istnieje). Nowe typy ``hub``, ``concept``, ``technology``, ``decision``
+#: sa dodane od Fazy 0 refaktoru (styl AthleteStack: kazda z nich zyje pod
+#: jakims hubem / MOC-iem).
+_TYPES_REQUIRING_MOC = {
+    "module",
+    "adr",
+    "doc",
+    "changelog",
+    "hub",
+    "concept",
+    "technology",
+    "decision",
+}
 _INDEX_FILENAMES = {"_index.md"}
 
 
@@ -120,6 +211,7 @@ def analyze(knowledge: VaultKnowledge) -> ConsistencyReport:
     )
 
     inconsistent_tags = _find_inconsistent_tags(notes_by_path)
+    structural_violations = _find_structural_violations(notes_by_path)
 
     return ConsistencyReport(
         total_notes=knowledge.total_notes,
@@ -127,6 +219,7 @@ def analyze(knowledge: VaultKnowledge) -> ConsistencyReport:
         dead_links=dead_links,
         missing_in_moc=missing_in_moc,
         inconsistent_tags=inconsistent_tags,
+        structural_violations=structural_violations,
     )
 
 
@@ -192,6 +285,87 @@ def _find_missing_in_moc(
 
     missing.sort()
     return missing
+
+
+def _find_structural_violations(
+    notes_by_path: dict[str, VaultNote],
+) -> list[StructuralViolation]:
+    """Szuka twardych naruszen kontraktow per-typ (Faza 5 refaktoru).
+
+    Obowiązujące reguły:
+
+    - ``type: hub`` → wymaga tagu ``hub`` we frontmatterze. (Generic
+      ``_find_inconsistent_tags`` tez to wylapie, ale tutaj meldujemy
+      to z pełnym kontekstem jako naruszenie **strukturalne**, bo hub
+      bez wlasnego tagu lamie cala nawigacje po nodach tematycznych.)
+    - ``type: decision`` → wymaga pola ``parent`` (ADR zawsze wisi
+      pod jakims hubem; bez parenta jest osierocony w grafie decyzji).
+    - ``type: technology`` → wymaga pola ``role`` we frontmatterze
+      (krotki opis roli — kontekst dla drugiego AI, **co** ta
+      technologia robi w systemie, a nie tylko ze jest uzyta).
+
+    Brak pola sprawdzamy przez ``note.frontmatter`` (raw dict) **oraz**
+    typowane atrybuty ``VaultNote`` — zeby zlapac zarowno przypadek
+    "klucz nie istnieje" jak i "klucz istnieje ale jest pusty / None".
+    """
+
+    violations: list[StructuralViolation] = []
+    for path, note in notes_by_path.items():
+        note_type = (note.type or "").strip()
+        if not note_type:
+            continue
+
+        normalized_type = note_type.lower()
+
+        if normalized_type == "hub":
+            lower_tags = {t.lower() for t in note.tags}
+            if "hub" not in lower_tags:
+                violations.append(
+                    StructuralViolation(
+                        note_path=path,
+                        note_type=note_type,
+                        rule="hub_requires_hub_tag",
+                        message=(
+                            "Notatka typu 'hub' musi miec tag 'hub' we "
+                            "frontmatterze (nawigacja po hubach opiera sie "
+                            "na tym tagu)."
+                        ),
+                    )
+                )
+
+        if normalized_type == "decision":
+            if not (note.parent or "").strip():
+                violations.append(
+                    StructuralViolation(
+                        note_path=path,
+                        note_type=note_type,
+                        rule="decision_requires_parent",
+                        message=(
+                            "Notatka typu 'decision' (ADR) musi miec pole "
+                            "'parent' wskazujace na hub tematyczny — "
+                            "inaczej decyzja nie jest nigdzie zindeksowana."
+                        ),
+                    )
+                )
+
+        if normalized_type == "technology":
+            role_value = note.frontmatter.get("role") if note.frontmatter else None
+            if not (isinstance(role_value, str) and role_value.strip()):
+                violations.append(
+                    StructuralViolation(
+                        note_path=path,
+                        note_type=note_type,
+                        rule="technology_requires_role",
+                        message=(
+                            "Notatka typu 'technology' musi miec pole "
+                            "'role' we frontmatterze — krotki opis roli "
+                            "technologii w systemie."
+                        ),
+                    )
+                )
+
+    violations.sort(key=lambda v: (v.note_path, v.rule))
+    return violations
 
 
 def _find_inconsistent_tags(

@@ -9,11 +9,19 @@ Decyzje ("dopisz link do MOC", "aktualizuj _index.md") nie nalezy do tej warstwy
 zostaw je agentowi (lub dedykowanej klasie ``MOCManager`` w przyszlej Fazie 4b).
 """
 
-from src.vault.consistency import ConsistencyReport, TagInconsistency, analyze
+from src.vault.consistency import (
+    KNOWN_TYPES,
+    ConsistencyReport,
+    TagInconsistency,
+    analyze,
+    is_known_type,
+)
 from src.vault.manager import VaultManager
 from src.vault.models import VaultKnowledge, VaultNote
 from src.vault.moc import (
     DEFAULT_INDEX_PATH,
+    DEFAULT_MOC_PATTERN,
+    LEGACY_MOC_PREFIX,
     IndexUpdateOutcome,
     MOCLinkOutcome,
     MOCManager,
@@ -22,7 +30,10 @@ from src.vault.moc import (
 __all__ = [
     "ConsistencyReport",
     "DEFAULT_INDEX_PATH",
+    "DEFAULT_MOC_PATTERN",
     "IndexUpdateOutcome",
+    "KNOWN_TYPES",
+    "LEGACY_MOC_PREFIX",
     "MOCLinkOutcome",
     "MOCManager",
     "TagInconsistency",
@@ -30,4 +41,5 @@ __all__ = [
     "VaultManager",
     "VaultNote",
     "analyze",
+    "is_known_type",
 ]

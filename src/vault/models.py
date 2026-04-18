@@ -10,7 +10,7 @@ Modele sa nieswiadome Gita i historii zmian. Do opisywania "co sie zmienilo"
 agent uzywa ``CommitInfo`` z warstwy git i doczytuje aktualna tresc plikow
 przez ``VaultManager.read_note``.
 
-``AgentAction`` (decyzja AI) zyje w ``src.agent.models`` — to kontrakt warstwy
+``ProposedWrite`` (decyzja AI) zyje w ``src.agent.models_actions`` — to kontrakt warstwy
 agenta, nie vaulta.
 
 Schemat frontmattera (kontrakt dla coding assistanta — musi byc w KAZDEJ notatce):
@@ -193,6 +193,68 @@ class VaultKnowledge(BaseModel):
         """Notatki ktore maja ``target`` w swoim polu ``related`` (graf symetryczny)."""
 
         return self._notes_for(self.related_index.get(self._normalize_ref(target), []))
+
+    def find_by_path_prefix(self, prefix: str) -> list[VaultNote]:
+        """Zwraca notatki, ktorych ``path`` zaczyna sie od ``prefix``.
+
+        Uzytecznie do szybkiego filtrowania po folderze (np. ``"modules/"``,
+        ``"adr/"``). Slash terminujacy prefix nie jest wymagany - agent moze
+        wolac ``find_by_path_prefix("modules")`` i dostac wszystko z tego
+        folderu. Porownanie jest case-sensitive, zgodnie ze slashami POSIX.
+
+        Wynik posortowany po sciezce (determinizm wyjscia dla modelu LLM).
+        Puste ``prefix`` zwraca wszystkie notatki.
+        """
+
+        if not prefix:
+            return sorted(self.by_path.values(), key=lambda n: n.path)
+        return sorted(
+            (note for path, note in self.by_path.items() if path.startswith(prefix)),
+            key=lambda n: n.path,
+        )
+
+    def wikilinks_in(self, target: str) -> list[str]:
+        """Zwraca listę **sciezek** notatek, ktore linkuja do ``target``.
+
+        Roznica vs ``backlinks_to``: tamta zwraca ``list[VaultNote]``, ta
+        zwraca surowe ``list[str]`` (sciezki relatywne wzgledem vaulta).
+        Uzywane w ``read_note``, zeby do modelu trafial lekki JSON z
+        samymi sciezkami - peelne ``VaultNote`` sa drogie w tokenach.
+
+        Wynik posortowany alfabetycznie (determinizm).
+        """
+
+        key = self._normalize_ref(target)
+        if not key:
+            return []
+        return sorted(self.backlinks_index.get(key, []))
+
+    def orphan_wikilinks(self) -> dict[str, list[str]]:
+        """Zwraca mape ``target -> list[sciezki_zrodlowe]`` dla osieroconych wikilinkow.
+
+        Osierocony wikilink = ``[[X]]`` w tresci jakiejs notatki, ale ``X``
+        nie odpowiada zadnemu istniejacemu plikowi w vaulcie (ani jako stem,
+        ani jako path). ``self.orphaned_links`` daje same targety - ta metoda
+        dodatkowo mowi **kto ich wzmiankuje** (kolumna "Wzmiankowane w" dla
+        ``_Pending_Concepts.md`` w Fazie 6).
+
+        Sciezki zrodlowe sa posortowane alfabetycznie. Targety w kluczach
+        zdupliowane nie beda - ``orphaned_links`` jest juz zdeduplikowane.
+        """
+
+        orphan_set = set(self.orphaned_links)
+        if not orphan_set:
+            return {}
+
+        result: dict[str, list[str]] = {}
+        for note in self.notes:
+            for link in note.wikilinks:
+                if link in orphan_set:
+                    result.setdefault(link, []).append(note.path)
+
+        for sources in result.values():
+            sources.sort()
+        return result
 
     def connected_to(self, target: str) -> list[VaultNote]:
         """Wszystkie notatki **powiazane** z ``target`` w grafie — jedna unia:

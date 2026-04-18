@@ -36,10 +36,54 @@ from src.vault.models import VaultKnowledge, VaultNote
 logger = logging.getLogger(__name__)
 
 DEFAULT_INDEX_PATH = "_index.md"
+
+#: Domyslny wzorzec nazewniczy MOC-ow. Potrojne podkreslenie jest konwencja
+#: AthleteStack (``MOC___Kompendium``, ``MOC___Architektura``). User moze
+#: zmienic wzorzec w ``config.yaml`` (``vault.moc_pattern``).
+DEFAULT_MOC_PATTERN = "MOC___{name}"
+
+#: Prefiks legacy **usuniety w Fazie 7** — ``MOC__X`` (podwojne
+#: podkreslenie) nie jest juz rozpoznawane jako MOC. Vault po czyszczeniu
+#: (patrz REFACTOR_PLAN.md) uzywa wylacznie ``MOC___{name}``. Stała
+#: zostala jako placeholder dla wstecznej kompatybilnosci importow — nie
+#: uzywaj w nowym kodzie.
+LEGACY_MOC_PREFIX = "MOC__"
+
+#: Token w ``moc_pattern`` oznaczajacy miejsce nazwy/labela MOC-a. Wzorzec
+#: MUSI zawierac ten token dokladnie raz \u2014 walidowane w ``_split_moc_pattern``.
+_MOC_PATTERN_TOKEN = "{name}"
+
 _OTHER_SECTION = "Other"
 _MOC_SECTION = "MOCs"
 
 _HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+
+def _split_moc_pattern(pattern: str) -> tuple[str, str]:
+    """Rozbija wzorzec ``MOC___{name}`` na (prefix, suffix).
+
+    Wzorzec MUSI zawierac ``{name}`` dokladnie raz. Prefix to wszystko przed
+    tokenem, suffix \u2014 wszystko po. Obecnie uzywany tylko prefix (suffix
+    zarezerwowany pod przyszle konwencje typu ``MOC___{name}.hub``).
+
+    Rzuca ``ValueError`` gdy wzorzec niepoprawny \u2014 walidacja configu tego
+    nie przepusci.
+    """
+
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("moc_pattern musi byc niepustym stringiem")
+    if pattern.count(_MOC_PATTERN_TOKEN) != 1:
+        raise ValueError(
+            f"moc_pattern musi zawierac token '{_MOC_PATTERN_TOKEN}' dokladnie raz, "
+            f"dostalismy {pattern!r}"
+        )
+    prefix, _, suffix = pattern.partition(_MOC_PATTERN_TOKEN)
+    if not prefix:
+        raise ValueError(
+            f"moc_pattern musi miec niepusty prefix przed '{_MOC_PATTERN_TOKEN}', "
+            f"dostalismy {pattern!r}"
+        )
+    return prefix, suffix
 
 
 class MOCLinkOutcome(BaseModel):
@@ -94,8 +138,54 @@ class MOCManager:
     ``no_moc_found`` i moze sam zdecydowac co dalej (utworzyc MOC, pominac, itp.).
     """
 
-    def __init__(self, vault_manager: VaultManager) -> None:
+    def __init__(
+        self,
+        vault_manager: VaultManager,
+        *,
+        moc_pattern: str = DEFAULT_MOC_PATTERN,
+    ) -> None:
+        """Tworzy managera MOC-ow ze sparametryzowanym wzorcem nazewniczym.
+
+        ``moc_pattern`` - format nazwy MOC z ``{name}`` jako placeholder labela.
+        Domyslnie ``"MOC___{name}"`` (konwencja AthleteStack, Faza 0).
+
+        **Faza 7:** legacy fallback ``MOC__X`` (podwojne podkreslenie)
+        zostal usuniety. Jedyna rozpoznawana konwencja to ``moc_pattern``
+        z configu + jawna deklaracja ``type: moc`` we frontmatterze.
+        """
+
         self.vault_manager = vault_manager
+        self._primary_prefix, self._primary_suffix = _split_moc_pattern(moc_pattern)
+        self.moc_pattern = moc_pattern
+
+    @classmethod
+    def from_config(
+        cls,
+        vault_manager: VaultManager,
+        config_path: "str | Path",
+    ) -> "MOCManager":
+        """Factory czytajace ``vault.moc_pattern`` z ``config.yaml``.
+
+        Brak klucza albo brak sekcji ``vault`` \u2192 default ``DEFAULT_MOC_PATTERN``.
+        Blednie uformowany wzorzec (brak ``{name}``) \u2192 ``ValueError`` z
+        konkretnego miejsca konfigu.
+        """
+
+        import yaml  # noqa: PLC0415 \u2014 lokalny import, yaml nie jest w hot path.
+
+        path = Path(config_path).expanduser().resolve()
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        vault_cfg = raw.get("vault") if isinstance(raw, dict) else None
+        pattern = DEFAULT_MOC_PATTERN
+        if isinstance(vault_cfg, dict):
+            raw_pattern = vault_cfg.get("moc_pattern")
+            if raw_pattern is not None:
+                if not isinstance(raw_pattern, str) or not raw_pattern.strip():
+                    raise ValueError(
+                        "config: vault.moc_pattern musi byc niepustym stringiem"
+                    )
+                pattern = raw_pattern.strip()
+        return cls(vault_manager, moc_pattern=pattern)
 
     def find_moc_for_note(
         self,
@@ -316,23 +406,45 @@ class MOCManager:
             )
         return orphans
 
-    @staticmethod
-    def _is_moc_note(note: VaultNote) -> bool:
+    def _is_moc_note(self, note: VaultNote) -> bool:
+        """Czy notatka jest MOC-iem wedlug primary patternu lub frontmattera.
+
+        Kolejnosc sprawdzania (Faza 7 — bez legacy fallback):
+
+        1. ``note.type == "moc"`` (case-insensitive) — jawna deklaracja
+           w frontmatterze wygrywa nad heurystyka nazwy.
+        2. Stem pasuje do primary prefixu (np. ``MOC___Kompendium`` gdy
+           ``moc_pattern = "MOC___{name}"``).
+
+        Legacy prefix ``MOC__X`` (podwojne podkreslenie) NIE jest juz
+        rozpoznawany — pliki tego typu muszly zostac zmigrowane do
+        konwencji z configu przed wlaczeniem Fazy 7.
+        """
+
         if (note.type or "").lower() == "moc":
             return True
-        return Path(note.path).stem.startswith("MOC__")
+        stem = Path(note.path).stem
+        if stem.startswith(self._primary_prefix):
+            return True
+        return False
 
-    @staticmethod
-    def _moc_label(moc: VaultNote) -> str | None:
+    def _moc_label(self, moc: VaultNote) -> str | None:
+        """Wyciaga label MOC-a (np. ``Core`` z ``MOC___Core.md``).
+
+        Parsuje stem wzgledem primary prefixu/suffixu z ``moc_pattern``.
+        Zwraca ``None`` gdy stem nie pasuje do wzorca.
+        """
+
         stem = Path(moc.path).stem
-        if stem.startswith("MOC__"):
-            label = stem[len("MOC__"):]
-            return label or None
-        return None
+        if not stem.startswith(self._primary_prefix):
+            return None
+        label = stem[len(self._primary_prefix):]
+        if self._primary_suffix and label.endswith(self._primary_suffix):
+            label = label[: -len(self._primary_suffix)] if self._primary_suffix else label
+        return label or None
 
-    @staticmethod
-    def _section_title_for(note: VaultNote) -> str:
-        if MOCManager._is_moc_note(note):
+    def _section_title_for(self, note: VaultNote) -> str:
+        if self._is_moc_note(note):
             return _MOC_SECTION
         if note.type:
             return note.type.strip() or _OTHER_SECTION
@@ -428,13 +540,12 @@ class MOCManager:
             new_raw += "\n"
         return new_raw
 
-    @classmethod
-    def _render_full_index(cls, knowledge: VaultKnowledge, *, index_path: str) -> str:
+    def _render_full_index(self, knowledge: VaultKnowledge, *, index_path: str) -> str:
         sections: dict[str, list[str]] = {}
         for note in sorted(knowledge.notes, key=lambda n: n.path):
             if note.path == index_path:
                 continue
-            section = cls._section_title_for(note)
+            section = self._section_title_for(note)
             sections.setdefault(section, []).append(f"- [[{Path(note.path).stem}]]")
 
         ordered_keys: list[str] = []
