@@ -145,6 +145,36 @@ def load_finalize_prompt(language: str, *, prompts_dir: Path | None = None) -> s
     return _load_named_prompt("finalize", language, prompts_dir)
 
 
+def load_moc_system_prompt(language: str, *, prompts_dir: Path | None = None) -> str:
+    """Wczytuje system prompt dla MOCAgenta.
+
+    MOCAgent to **osobny** agent AI - odpowiada wylacznie za utrzymanie
+    struktury nawigacyjnej MOC (huby, technologie, koncepty), nie
+    dokumentuje commitow. Prompt systemowy instruuje go w algorytmie:
+    audyt -> plan -> akcje -> submit_plan.
+    """
+
+    return _load_named_prompt("moc_system", language, prompts_dir)
+
+
+def load_moc_user_prompt(language: str, *, prompts_dir: Path | None = None) -> str:
+    """Wczytuje szablon user-promptu dla MOCAgenta (z placeholderami).
+
+    Placeholdery: ``{{project_name}}``, ``{{vault_path}}``, ``{{moc_path}}``,
+    ``{{language}}``, ``{{trigger_context}}``. MOCAgent wypelnia je przed
+    startem sesji (``trigger_context`` np. "uruchomiony flaga --moc-only"
+    albo "delegacja z doc-agenta po {{n}} commitach").
+    """
+
+    return _load_named_prompt("moc_user", language, prompts_dir)
+
+
+def load_moc_finalize_prompt(language: str, *, prompts_dir: Path | None = None) -> str:
+    """Wczytuje finalize prompt dla MOCAgenta (twardy nudge na submit_plan)."""
+
+    return _load_named_prompt("moc_finalize", language, prompts_dir)
+
+
 def _load_named_prompt(name: str, language: str, prompts_dir: Path | None) -> str:
     """Wspolna logika odczytu ``<name>_<lang>.md`` z katalogu Prompts/.
 
@@ -185,5 +215,8 @@ __all__ = [
     "SUPPORTED_LANGUAGES",
     "load_chunk_instruction_prompt",
     "load_finalize_prompt",
+    "load_moc_finalize_prompt",
+    "load_moc_system_prompt",
+    "load_moc_user_prompt",
     "load_system_prompt",
 ]

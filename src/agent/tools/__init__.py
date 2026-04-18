@@ -45,6 +45,7 @@ formatem wspolnym dla OpenAI/Anthropic/OpenRouter (patrz ADR__ToolCalling).
 
 from src.agent.tools.base import Tool, ToolResult
 from src.agent.tools.context import ToolExecutionContext
+from src.agent.tools.moc_ops import MocAuditTool, MocSetIntroTool
 from src.agent.tools.registry import ToolRegistry
 from src.agent.tools.session import SubmitPlanTool
 from src.agent.tools.vault_read import (
@@ -93,6 +94,8 @@ __all__ = [
     "ListNotesTool",
     "ListPendingConceptsTool",
     "ListTagsTool",
+    "MocAuditTool",
+    "MocSetIntroTool",
     "ReadNoteTool",
     "RegisterPendingConceptTool",
     "ReplaceSectionTool",

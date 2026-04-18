@@ -24,6 +24,7 @@ architektoniczna (zobacz ROADMAP_AGENT.md, Faza 6).
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -46,6 +47,7 @@ from src.agent import (
 )
 from src.agent.action_executor import ActionExecutionReport
 from src.agent.models_chunks import ChunkedCommit, DiffChunk
+from src.agent.moc_agent import MOCAgent, MOCSessionResult
 from src.agent.moc_planner import PlannedVaultWrite
 from src.git.models import CommitInfo
 
@@ -389,7 +391,7 @@ async def _process_single_commit(
         return False
 
 
-async def _run(run_logger: RunLogger) -> int:
+async def _run(run_logger: RunLogger, *, moc_only: bool = False) -> int:
     """Glowna korutyna \u2014 buduje agenta, iteruje po pending commitach.
 
     Zwraca kod wyjscia dla ``sys.exit``:
@@ -447,12 +449,167 @@ async def _run(run_logger: RunLogger) -> int:
         )
 
     try:
+        if moc_only:
+            return await _run_moc_only(agent, run_logger)
         return await _run_agent_loop(agent, run_logger)
     finally:
         try:
             await agent.stop_mcp()
         except Exception as exc:
             logger.warning("stop_mcp podczas cleanupu padlo: %r", exc)
+
+
+async def _run_moc_only(agent: "Agent", run_logger: RunLogger) -> int:
+    """Osobny flow - odpala wylacznie MOCAgenta (bez dokumentowania commitow).
+
+    Flow:
+
+    1. Sync vault (pull) - zeby nie wejsc w konflikt jesli user cos dopisal recznie.
+    2. Ensure bootstrap MOC - MOCAgent zaklada ze root-MOC istnieje.
+    3. Uruchom ``MOCAgent.run_session`` z trigger_context = "flaga --moc-only".
+    4. Jesli session zwrocil jakies pisy - preview + user approval + commit
+       pod prefiksem ``Agent-MOC:``.
+    5. Jesli audyt byl czysty (no writes) - informacja w konsoli, zero commita.
+    """
+
+    console.print("[bold cyan]TRYB MOC-ONLY[/] \u2014 MOCAgent audytuje MOC i uzupelnia strukture.\n")
+
+    console.print("[cyan]Sync vault (pull + auto-stash)\u2026[/]")
+    try:
+        agent.git_vault_syncer.sync()
+    except Exception as exc:
+        console.print(f"[red]Sync vault nie powiodl sie: {exc}[/]")
+        run_logger.log(
+            f"sync_vault_failed: {exc}",
+            level="error",
+            error_type=type(exc).__name__,
+        )
+        return 1
+
+    try:
+        bootstrap_outcome = agent.ensure_bootstrap_moc()
+    except RuntimeError as exc:
+        console.print(f"[red]Bootstrap MOC nie powiodl sie: {exc}[/]")
+        return 1
+    if bootstrap_outcome is not None and bootstrap_outcome.result in ("created", "merged"):
+        count = len(bootstrap_outcome.added_links)
+        label = "utworzony" if bootstrap_outcome.result == "created" else "zmergowany"
+        console.print(
+            f"[green]Bootstrap MOC {label}: {bootstrap_outcome.path} (+{count} linkow).[/]"
+        )
+
+    try:
+        moc_agent = MOCAgent.from_agent(agent)
+    except ValueError as exc:
+        console.print(f"[red]Blad konfiguracji MOCAgenta: {exc}[/]")
+        return 1
+
+    if not moc_agent.config.enabled:
+        console.print("[yellow]MOCAgent wylaczony w config.yaml (moc.enabled=false). Nic nie robie.[/]")
+        return 0
+
+    return await _run_moc_agent(
+        agent,
+        moc_agent,
+        run_logger,
+        trigger_context="uruchomienie flaga --moc-only",
+    )
+
+
+async def _run_moc_agent(
+    agent: "Agent",
+    moc_agent: "MOCAgent",
+    run_logger: RunLogger,
+    *,
+    trigger_context: str,
+) -> int:
+    """Pelen cykl sesji MOCAgenta: audyt + akcje + preview + approval + commit.
+
+    Wydzielone zeby moglo byc wolane zarowno z ``--moc-only`` jak i jako
+    delegacja po zakonczeniu doc-loopu (``moc.delegate_after_docs=true``).
+    Zwraca ``0`` przy sukcesie (z commitem albo bez zmian), ``1`` przy
+    bledzie ktory user powinien zobaczyc.
+    """
+
+    console.print(Panel.fit(
+        "[bold]MOCAgent sesja[/]\n"
+        f"[dim]trigger: {trigger_context}[/]\n"
+        f"[dim]MOC: {moc_agent.config.moc_path}[/]",
+        border_style="cyan",
+    ))
+
+    run_logger.log("moc_agent_started", trigger=trigger_context, moc_path=moc_agent.config.moc_path)
+
+    try:
+        session = await moc_agent.run_session(trigger_context=trigger_context)
+    except RuntimeError as exc:
+        console.print(f"[red]MOCAgent padl: {exc}[/]")
+        run_logger.log(
+            f"moc_agent_failed: {exc}",
+            level="error",
+            error_type=type(exc).__name__,
+        )
+        return 1
+
+    run_logger.log(
+        "moc_agent_session_done",
+        iterations=session.iterations_used,
+        tool_calls=session.tool_calls_count,
+        finalized=session.finalized_by_submit_plan,
+        has_changes=session.has_changes,
+    )
+
+    if session.plan is None:
+        console.print(f"[dim]MOCAgent pominiety: {session.skipped_reason or 'brak planu'}.[/]")
+        return 0
+
+    if not session.has_changes:
+        console.print(
+            f"[green]MOCAgent: audyt czysty, brak zmian.[/] "
+            f"[dim](iteracji: {session.iterations_used}, tool-calls: {session.tool_calls_count})[/]"
+        )
+        console.print(f"[dim]Summary: {session.plan.summary}[/]")
+        return 0
+
+    renderer = PreviewRenderer(console=console)
+    report, batch = moc_agent.apply_pending(session.plan)
+    renderer.render_plan(session.plan, [])
+
+    console.print(
+        f"\n[dim]MOCAgent: {session.iterations_used} iteracji, "
+        f"{session.tool_calls_count} tool-calls, "
+        f"{len(session.plan.writes)} pisow zaproponowanych.[/]\n"
+    )
+
+    approved = ask_accept_pending()
+    if not approved:
+        console.print("[yellow]Rollback - vault cofniety do stanu sprzed MOCAgenta.[/]")
+        moc_agent.rollback_pending(batch)
+        run_logger.log("moc_agent_rejected", writes=len(session.plan.writes))
+        return 0
+
+    moc_agent.finalize_pending(batch)
+    try:
+        sha = moc_agent.commit_vault_moc(
+            approved=True,
+            execution_report=report,
+            summary=session.plan.summary,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]Commit MOC padl: {exc}[/]")
+        run_logger.log(f"moc_commit_failed: {exc}", level="error")
+        return 1
+
+    console.print(
+        f"[green]Commit MOC: [cyan]{sha[:7]}[/] - {len(report.touched_files)} plikow zmienione.[/]"
+    )
+    run_logger.log(
+        "moc_agent_commit",
+        sha=sha,
+        touched=len(report.touched_files),
+        summary=session.plan.summary,
+    )
+    return 0
 
 
 async def _run_agent_loop(agent: "Agent", run_logger: RunLogger) -> int:
@@ -469,6 +626,40 @@ async def _run_agent_loop(agent: "Agent", run_logger: RunLogger) -> int:
             error_type=type(exc).__name__,
         )
         return 1
+
+    try:
+        bootstrap_outcome = agent.ensure_bootstrap_moc()
+    except RuntimeError as exc:
+        console.print(f"[red]Bootstrap MOC nie powiodl sie: {exc}[/]")
+        run_logger.log(
+            f"bootstrap_moc_failed: {exc}",
+            level="error",
+            error_type=type(exc).__name__,
+        )
+        return 1
+
+    if bootstrap_outcome is not None:
+        count = len(bootstrap_outcome.added_links)
+        if bootstrap_outcome.result == "created":
+            console.print(
+                f"[green]Bootstrap MOC utworzony: {bootstrap_outcome.path} "
+                f"(+{count} linkow z vaulta)[/] "
+                f"[dim](label: {bootstrap_outcome.label})[/]"
+            )
+        elif bootstrap_outcome.result == "merged":
+            console.print(
+                f"[green]Bootstrap MOC zmergowany: {bootstrap_outcome.path} "
+                f"(+{count} brakujacych linkow)[/]"
+            )
+        elif bootstrap_outcome.result == "is_not_a_moc":
+            console.print(
+                f"[yellow]Bootstrap MOC pominiety: {bootstrap_outcome.path} "
+                "istnieje ale nie jest MOC-iem \u2014 sprawdz frontmatter.[/]"
+            )
+        else:
+            console.print(
+                f"[dim]Bootstrap MOC: {bootstrap_outcome.path} \u2014 {bootstrap_outcome.result} (zero zmian).[/]"
+            )
 
     state = agent.load_state()
     renderer = PreviewRenderer(console=console)
@@ -509,7 +700,27 @@ async def _run_agent_loop(agent: "Agent", run_logger: RunLogger) -> int:
     else:
         console.print(f"\n[green]Koniec biegu. Przetworzono commitow w tej sesji: {processed_count}[/]")
 
-    return 0
+    try:
+        moc_agent = MOCAgent.from_agent(agent)
+    except ValueError as exc:
+        console.print(f"[yellow]MOCAgent nieaktywny (blad configu): {exc}[/]")
+        return 0
+
+    if not moc_agent.config.enabled or not moc_agent.config.delegate_after_docs:
+        return 0
+
+    trigger = (
+        f"delegacja po doc-agencie (przetworzono {processed_count} commitow)"
+        if processed_count > 0
+        else "delegacja po doc-agencie (brak nowych commitow)"
+    )
+    console.print("\n[bold cyan]---> Delegacja do MOCAgenta[/] [dim](moc.delegate_after_docs=true)[/]")
+    try:
+        return await _run_moc_agent(agent, moc_agent, run_logger, trigger_context=trigger)
+    except Exception as exc:
+        console.print(f"[yellow]MOCAgent padl ale doc-agent skonczyl - kontynuuje: {exc}[/]")
+        run_logger.log(f"moc_agent_delegation_failed: {exc}", level="warning")
+        return 0
 
 
 def _read_effort_from_config(config_path: Path, provider_name: str) -> str | None:
@@ -528,7 +739,35 @@ def _read_effort_from_config(config_path: Path, provider_name: str) -> str | Non
         return None
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parsuje argv. Wspierane flagi:
+
+    - ``--moc-only`` — pomija dokumentowanie commitow projektu i odpala
+      tylko MOCAgenta (audyt + rozbudowa MOC).
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="obsagent",
+        description=(
+            "Obsidian Git Documentation Agent. Bez flag: dokumentuje nowe "
+            "commity projektu; z --moc-only: odpala tylko MOCAgenta (audyt "
+            "+ rozbudowa MOC, bez dokumentowania)."
+        ),
+    )
+    parser.add_argument(
+        "--moc-only",
+        action="store_true",
+        help=(
+            "Pomin dokumentowanie commitow - odpal tylko MOCAgenta. "
+            "Uzywaj gdy vault jest juz w pelni udokumentowany a chcesz "
+            "odswiezyc strukture nawigacyjna MOC (huby, technologie, koncepty)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
+    args = _parse_args()
     load_dotenv()
 
     logs_cfg = _load_logs_config(CONFIG_PATH)
@@ -550,7 +789,7 @@ def main() -> None:
 
     exit_code = 0
     try:
-        exit_code = asyncio.run(_run(run_logger))
+        exit_code = asyncio.run(_run(run_logger, moc_only=args.moc_only))
     except KeyboardInterrupt:
         console.print("\n[yellow]Przerwano przez uzytkownika (Ctrl+C). State zostal zapisany przy ostatniej iteracji.[/]")
         run_logger.log("interrupted", level="warning")

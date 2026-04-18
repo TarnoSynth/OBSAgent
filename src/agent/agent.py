@@ -33,6 +33,7 @@ from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from logs.run_logger import RunLogger
+    from src.vault.moc import BootstrapMocOutcome
 
 from src.agent.action_executor import ActionExecutionReport, ActionExecutor
 from src.agent.chunk_cache import ChunkCache
@@ -62,6 +63,8 @@ from src.agent.tools import (
     ListNotesTool,
     ListPendingConceptsTool,
     ListTagsTool,
+    MocAuditTool,
+    MocSetIntroTool,
     ReadNoteTool,
     RegisterPendingConceptTool,
     ReplaceSectionTool,
@@ -119,6 +122,9 @@ DEFAULT_LANGUAGE = "pl"
 DEFAULT_PROJECT_NAME_FALLBACK = "project"
 DEFAULT_VAULT_COMMIT_PREFIX = "Agent: sync z "
 DEFAULT_VAULT_INDEX_FILENAME = "_index.md"
+DEFAULT_BOOTSTRAP_MOC_ENABLED = True
+DEFAULT_BOOTSTRAP_MOC_NAME = "Kompendium"
+DEFAULT_BOOTSTRAP_MOC_COMMIT_PREFIX = "Agent: bootstrap "
 DEFAULT_MAX_TOOL_ITERATIONS = 8
 DEFAULT_FORCE_SUBMIT_IN_LAST_N = 2
 """Ile OSTATNICH iteracji petli tool-use ma wymuszac ``submit_plan``.
@@ -155,9 +161,13 @@ class AgentConfig:
     project_name: str
     vault_commit_prefix: str
     vault_index_filename: str
+    vault_moc_pattern: str
     max_tool_iterations: int
     force_submit_in_last_n: int
     budget_hint_last_n: int
+    bootstrap_moc_enabled: bool
+    bootstrap_moc_name: str
+    bootstrap_moc_title: str | None
 
 
 class Agent:
@@ -321,6 +331,50 @@ class Agent:
                 )
             vault_index_filename = index_filename_raw.strip()
 
+        from src.vault.moc import DEFAULT_MOC_PATTERN as _VAULT_DEFAULT_MOC_PATTERN
+
+        moc_pattern_raw = vault_cfg.get("moc_pattern")
+        if moc_pattern_raw is None:
+            vault_moc_pattern = _VAULT_DEFAULT_MOC_PATTERN
+        else:
+            if not isinstance(moc_pattern_raw, str) or not moc_pattern_raw.strip():
+                raise ValueError(
+                    "config: vault.moc_pattern musi byc niepustym stringiem"
+                )
+            vault_moc_pattern = moc_pattern_raw.strip()
+
+        bootstrap_cfg_raw = vault_cfg.get("bootstrap_moc")
+        if bootstrap_cfg_raw is None:
+            bootstrap_moc_enabled = DEFAULT_BOOTSTRAP_MOC_ENABLED
+            bootstrap_moc_name = DEFAULT_BOOTSTRAP_MOC_NAME
+            bootstrap_moc_title: str | None = None
+        else:
+            if not isinstance(bootstrap_cfg_raw, dict):
+                raise ValueError("config: vault.bootstrap_moc musi byc mapa")
+            bootstrap_moc_enabled = bool(
+                bootstrap_cfg_raw.get("enabled", DEFAULT_BOOTSTRAP_MOC_ENABLED)
+            )
+            name_raw = bootstrap_cfg_raw.get("name", DEFAULT_BOOTSTRAP_MOC_NAME)
+            if not isinstance(name_raw, str) or not name_raw.strip():
+                raise ValueError(
+                    "config: vault.bootstrap_moc.name musi byc niepustym stringiem"
+                )
+            if any(ch.isspace() for ch in name_raw.strip()):
+                raise ValueError(
+                    "config: vault.bootstrap_moc.name nie moze zawierac whitespace"
+                )
+            bootstrap_moc_name = name_raw.strip()
+            title_raw = bootstrap_cfg_raw.get("title")
+            if title_raw is None:
+                bootstrap_moc_title = None
+            elif isinstance(title_raw, str) and title_raw.strip():
+                bootstrap_moc_title = title_raw.strip()
+            else:
+                raise ValueError(
+                    "config: vault.bootstrap_moc.title musi byc niepustym stringiem "
+                    "albo nieobecne"
+                )
+
         config = AgentConfig(
             config_path=resolved,
             project_repo_path=Path(project_repo).expanduser().resolve(),
@@ -331,9 +385,13 @@ class Agent:
             project_name=project_name,
             vault_commit_prefix=vault_commit_prefix,
             vault_index_filename=vault_index_filename,
+            vault_moc_pattern=vault_moc_pattern,
             max_tool_iterations=max_tool_iterations,
             force_submit_in_last_n=force_submit_in_last_n,
             budget_hint_last_n=budget_hint_last_n,
+            bootstrap_moc_enabled=bootstrap_moc_enabled,
+            bootstrap_moc_name=bootstrap_moc_name,
+            bootstrap_moc_title=bootstrap_moc_title,
         )
 
         provider = build_provider(resolved, run_logger=run_logger)
@@ -368,6 +426,96 @@ class Agent:
 
         self.git_project_syncer.sync()
         self.git_vault_syncer.sync()
+
+    def ensure_bootstrap_moc(self) -> "BootstrapMocOutcome | None":
+        """Idempotentnie zapewnia ze root-MOC vaulta istnieje (single-shot bootstrap).
+
+        Rozwiazuje problem "pusty/mlody vault - wszystkie notatki maja
+        `parent: [[MOC___Kompendium]]` wskazujacy na nieistniejacy plik".
+        Po pierwszym biegu plik jest na dysku i dalsze biegi daja
+        `already_present` bez zmian.
+
+        Zachowanie:
+
+        - Jesli ``agent.config.bootstrap_moc_enabled`` = False -> zwraca ``None``.
+        - Jesli plik juz istnieje jako MOC -> ``already_present``, bez commita.
+        - Jesli plik istnieje ale NIE jest MOC-iem (user ma cos swojego) ->
+          ``is_not_a_moc``, bez commita ani nadpisywania.
+        - Jesli plik nie istnieje -> tworzy go, commituje jeden raz z
+          wiadomoscia ``'Agent: bootstrap <path>'``.
+
+        Bootstrap commituje **bezposrednio** (bez pending/preview) bo:
+        1) tresc jest deterministyczna (render_bootstrap_moc),
+        2) bez niego wszystkie kolejne notatki maja `parent` -> dead link,
+        3) zachowanie jest idempotentne - drugi bieg nic nie zrobi.
+
+        Zwraca ``BootstrapMocOutcome`` gdy bootstrap byl wykonany (created
+        albo already_present/is_not_a_moc), ``None`` gdy wylaczone.
+        """
+
+        if not self.config.bootstrap_moc_enabled:
+            return None
+
+        from src.vault.moc import MOCManager
+
+        moc_manager = MOCManager(
+            self.vault_manager,
+            moc_pattern=self.config.vault_moc_pattern,
+        )
+        outcome = moc_manager.ensure_bootstrap_moc(
+            name=self.config.bootstrap_moc_name,
+            title=self.config.bootstrap_moc_title,
+            language=self.config.language,
+        )
+
+        if outcome.result not in ("created", "merged"):
+            return outcome
+
+        try:
+            repo = Repo(self.config.vault_path)
+            abs_path = str((self.config.vault_path / outcome.path).resolve())
+            repo.index.add([abs_path])
+            verb = "bootstrap" if outcome.result == "created" else "rebuild"
+            count = len(outcome.added_links)
+            subject = (
+                f"{DEFAULT_BOOTSTRAP_MOC_COMMIT_PREFIX}{outcome.path}"
+                if outcome.result == "created"
+                else f"Agent: rebuild {outcome.path} (+{count} linkow)"
+            )
+            body_lines: list[str] = []
+            if outcome.added_links:
+                body_lines.append(f"Dopisane wpisy ({count}):")
+                for line in outcome.added_links:
+                    body_lines.append(f"- {line}")
+            message = subject if not body_lines else f"{subject}\n\n" + "\n".join(body_lines)
+
+            author = Actor("obsidian-doc-agent", "agent@local")
+            commit = repo.index.commit(message, author=author, committer=author)
+            logger.info(
+                "ensure_bootstrap_moc: %s %s i zacommitowany (%s, +%d linkow)",
+                outcome.path, verb, commit.hexsha[:7], count,
+            )
+            if self.run_logger is not None:
+                try:
+                    self.run_logger.log(
+                        f"bootstrap_moc_{outcome.result}: {outcome.path}",
+                        level="info",
+                        path=outcome.path,
+                        vault_sha=commit.hexsha,
+                        added_links_count=count,
+                    )
+                except Exception:  # pragma: no cover - nie blokuj bootstrapa
+                    pass
+        except GitCommandError as exc:
+            raise RuntimeError(
+                f"git add/commit bootstrap MOC sie nie udal: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"bootstrap MOC: commit sie nie udal ({type(exc).__name__}): {exc}"
+            ) from exc
+
+        return outcome
 
     def load_state(self) -> AgentState:
         """Wczytuje state z ``.agent-state.json`` albo tworzy nowy (pierwszy start).
@@ -1200,6 +1348,7 @@ class Agent:
             self.vault_manager,
             knowledge,
             index_path=self.config.vault_index_filename,
+            language=self.config.language,
         )
 
     def execute_plan(
@@ -1603,6 +1752,8 @@ def _register_default_tools(registry: ToolRegistry) -> None:
     registry.register(CreateDecisionTool())
     registry.register(CreateModuleTool())
     registry.register(CreateChangelogEntryTool())
+    registry.register(MocAuditTool())
+    registry.register(MocSetIntroTool())
     registry.register(SubmitPlanTool())
 
 

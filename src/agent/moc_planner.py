@@ -47,7 +47,13 @@ from src.agent.models_actions import ProposedWrite
 from src.agent.tools.vault_write.register_pending_concept import PENDING_CONCEPTS_PATH
 from src.vault.manager import VaultManager
 from src.vault.models import VaultKnowledge, VaultNote
-from src.vault.moc import DEFAULT_INDEX_PATH, MOCManager
+from src.vault.moc import (
+    DEFAULT_INDEX_PATH,
+    MOCManager,
+    insert_into_moc_section,
+    moc_contains_link,
+    moc_section_for_type,
+)
 
 
 PlanKind = Literal["moc_append", "index_update", "index_create"]
@@ -88,6 +94,7 @@ def plan_post_action_updates(
     knowledge: VaultKnowledge,
     *,
     index_path: str = DEFAULT_INDEX_PATH,
+    language: str = "pl",
 ) -> list[PlannedVaultWrite]:
     """Safety-net: dokleja brakujace MOC / index wpisy dla ``ProposedWrite``.
 
@@ -153,23 +160,53 @@ def plan_post_action_updates(
         if (note.type or "").lower() == "index":
             continue
 
-        # Faza 7: safety-net jest aktywny TYLKO dla notatek ``create``, ktore
-        # nie maja ``parent`` we frontmatterze. Jesli model ustawil parent
-        # albo notatka jest tylko aktualizowana — respektujemy jego decyzje
-        # (model wie lepiej, narzedzia mial i z nich skorzystal).
-        if action.type == "create" and not note.parent and not _is_moc_note(note):
-            moc = moc_manager.find_moc_for_note(note, knowledge=knowledge)
-            if moc is not None and moc.path not in tool_touched_mocs:
-                moc_path = moc.path
-                draft = moc_state.get(moc_path)
+        # Faza 7+ safety-net dla tworzenia notatek: dopisujemy link do MOC-a,
+        # zeby graf byl spojny, nawet gdy model swiadomie ustawil parent ale
+        # zapomnial wywolac `add_moc_link`.
+        #
+        # Dwa przypadki:
+        # (A) notatka MA `parent: [[MOC___X]]` ale MOC jej nie linkuje -
+        #     dolinkowujemy w tym samym MOC (source of truth = parent).
+        # (B) notatka nie ma `parent` - uzywamy heurystyki
+        #     `find_moc_for_note` (stary fallback, `update` rowniez).
+        #
+        # Oba przypadki pomijamy, jesli tool cally w tej samej sesji juz
+        # tkneli ten MOC (model sam zadbal - zakladamy ze zrobil to dobrze).
+        if not _is_moc_note(note):
+            target_moc_path: str | None = None
+
+            if action.type == "create" and note.parent:
+                # (A) parent jako wikilink -> sprawdz czy to plik MOC na dysku
+                parent_stem = str(note.parent).strip()
+                if parent_stem:
+                    parent_rel = f"{parent_stem}.md"
+                    if (
+                        _looks_like_moc_path(parent_rel)
+                        and vault_manager.note_exists(parent_rel)
+                    ):
+                        target_moc_path = parent_rel
+
+            if target_moc_path is None and action.type == "create" and not note.parent:
+                # (B) brak parenta - heurystyka find_moc_for_note
+                moc = moc_manager.find_moc_for_note(note, knowledge=knowledge)
+                if moc is not None:
+                    target_moc_path = moc.path
+
+            if target_moc_path is not None and target_moc_path not in tool_touched_mocs:
+                draft = moc_state.get(target_moc_path)
                 if draft is None:
-                    draft = _FileDraft(initial=vault_manager.read_text(moc_path))
-                    moc_state[moc_path] = draft
+                    draft = _FileDraft(initial=vault_manager.read_text(target_moc_path))
+                    moc_state[target_moc_path] = draft
 
                 stem = Path(note.path).stem
-                if not _moc_contains_link(draft.current, stem):
-                    draft.current = _append_line(draft.current, f"- [[{stem}]]")
-                    moc_preview.setdefault(moc_path, []).append(f"- [[{stem}]]")
+                if not moc_contains_link(draft.current, stem):
+                    section = moc_section_for_type(note.type, language)
+                    new_text = insert_into_moc_section(draft.current, section, stem)
+                    if new_text != draft.current:
+                        draft.current = new_text
+                        moc_preview.setdefault(target_moc_path, []).append(
+                            f"[{section}] - [[{stem}]]"
+                        )
 
         if action.type == "create":
             # _section_title_for stalo sie instance method po parametryzacji
@@ -341,14 +378,6 @@ def _looks_like_moc_path(path: str) -> bool:
 
     stem = Path(path).stem
     return stem.startswith("MOC__")
-
-
-def _moc_contains_link(content: str, stem: str) -> bool:
-    """Czy tresc MOC zawiera juz wikilink ``[[stem]]`` lub ``[[stem|...]]``."""
-
-    target = re.escape(stem)
-    pattern = re.compile(r"\[\[" + target + r"(\|[^\]]*)?(#[^\]]*)?\]\]")
-    return bool(pattern.search(content))
 
 
 def _append_line(existing: str, line: str) -> str:
