@@ -1,29 +1,50 @@
 # Documentation plan finalization (FINALIZE)
 
-You have already analyzed **all** diff fragments of this commit in prior conversation turns — you returned summaries of each chunk. Those summaries are collected below together with vault context and templates.
+You have already analyzed **all** diff fragments of this commit in prior conversation turns — you returned summaries of each chunk. Those summaries are collected below together with the vault map.
 
-Now **finalize the work**: call the `submit_plan` tool EXACTLY ONCE with the action plan for the documentation vault.
+Now **work in a tool-use loop**: call vault_read tools (exploration) and vault_write tools (writing) iteratively, and at the end call `submit_plan` EXACTLY ONCE with a short `summary`.
+
+## HARD LOOP CONTRACT — read before the first tool call
+
+- **You have a **bounded iteration budget** (`max_tool_iterations`, usually 20).** One iteration = one AI provider call + the tool calls inside it.
+- **`submit_plan` is the only terminator.** Without it the session fails validation, the plan is discarded, and retry restarts from scratch.
+- **As a help**, the loop will append `[budzet-petli: iteration X/N, remaining M]` to `tool_result` content when you get close to the limit. When you see `remaining <= 2` — **the next turn must be `submit_plan`**.
+- **Hard force:** on the final iterations the provider receives `tool_choice={"type":"tool","name":"submit_plan"}` and **won't** let you call anything else. If you end up there, something went wrong — plan the termination earlier.
+- **Typical sensible flow:** 1-2 read-only exploration turns → 2-5 write turns → `submit_plan`. Total **5-10 iterations** for most commits. If you feel you need 15+ — you're probably duplicating work.
+
+## Batching rule — save iterations
+
+One provider turn can contain **multiple tool calls** (`parallel_tool_calls=False`, but the model can emit a list in a single response). Use this:
+
+- **Read in parallel.** If you know you need `read_note` on 3 files — emit 3 calls in one turn, not three.
+- **Write in parallel within one file.** E.g. when updating a hub: `replace_section` + `add_table_row` + `add_related_link` + `update_frontmatter` — all in **one** assistant turn. Each separate turn is an extra iteration + LLM latency (30-80s on Opus).
+- **Don't ping-pong.** The pattern "create_X → (next turn) update_frontmatter(X, ...) → (next turn) add_related_link(X, ...)" burns 3 iterations on operations that should be in 1 turn.
+- **Don't commit perfectionism.** `submit_plan` with 4 solid writes is better than an exhausted budget with 13 granular updates on the same note.
 
 ## What to base the plan on
 
 1. **Collected chunk summaries** — these are your "analysis notes". Treat them as one coherent summary of the whole commit, grouped by files.
-2. **Vault state** (current notes, MOC, resources) — so you don't duplicate docs and can link to existing entries.
+2. **Vault map** (MOCs + hubs, without full content) — to decide where to link and whether something already exists. Pull details via `list_notes` / `read_note` / `find_related`.
 3. **Manual user changes in the vault** — if user already wrote something manually, don't overwrite; incorporate into the plan.
-4. **Note templates** — use their structure (frontmatter + sections) when creating new notes.
+4. **Note type examples** (attached in the system prompt) — use their structure (frontmatter + sections) when creating new notes.
 
 ## Decision rules (reminder)
 
-- One commit = one `changelog` note (unless commit is trivial — empty `actions` list is fine then)
-- Architectural changes → new `adr` note
-- New code module → new `module` note
-- MOC (`MOC__*.md`) and index (`_index.md`) are **not** in the plan — the agent planner updates them itself
-- Wikilinks `[[stem]]` instead of paths; frontmatter matching templates
+- One commit = one `changelog` note (via `create_changelog_entry`) — unless commit is trivial and you don't call any write tools.
+- Architectural changes → `create_decision` (automatically adds a row to the ADR table in the parent hub).
+- New code module → `create_module`.
+- New concept in discussion → `create_concept`; new technology → `create_technology`.
+- Generic `create_note` / `update_note` are **only** for `type: doc` (free-form docs). For types: `hub`, `concept`, `technology`, `decision`, `module`, `changelog` use the dedicated tools EXCLUSIVELY.
+- Adding MOC entries — via `add_moc_link` (idempotent).
+- Wikilinks `[[stem]]` instead of paths; frontmatter matching the examples.
+- Orphan wikilink (you refer to something with no file) → `register_pending_concept`, don't block documentation.
 
-## Response format
+## Session end format
 
-Call `submit_plan` with arguments:
+At the end of the session, call `submit_plan` with fields:
 
-- `summary`: 1-2 sentences on what you're doing for this commit and why (based on collected summaries)
-- `actions`: list of `AgentAction` with fields `type` (`create`/`update`/`append`), `path` (relative, `.md`), `content` (full body for create/update, appendix only for append)
+- `summary`: 1-2 sentences on what you did for this commit and why (based on collected chunk summaries).
 
-Do not write anything outside the tool call.
+`submit_plan` no longer accepts an action list — those are already registered via individual tool calls. The summary goes straight into the user preview and into the vault commit message.
+
+**An empty plan is allowed.** If the commit adds no documentation value (dep bump, formatting, trivial bugfix) — do NOT register any writes, just call `submit_plan(summary="...")` with the reason. Ideal path is 1 iteration.
